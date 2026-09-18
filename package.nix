@@ -2,6 +2,7 @@
 , rustPlatform
 , makeWrapper
 , util-linux
+, coreutils
 }:
 
 rustPlatform.buildRustPackage {
@@ -18,7 +19,7 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     wrapProgram $out/bin/dfmount \
-      --prefix PATH : ${lib.makeBinPath [ util-linux ]}
+      --prefix PATH : ${lib.makeBinPath [ util-linux coreutils ]}
   '';
 
   meta = with lib; {
