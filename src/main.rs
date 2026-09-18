@@ -16,7 +16,7 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::{
     io,
-    process::{Command, Stdio},
+    process::Command,
     time::Duration,
 };
 
@@ -230,7 +230,7 @@ fn run_tui() -> Result<()> {
     loop {
         terminal.draw(|f| {
             let chunks = Layout::default()
-                .direction(Direction::VERTICAL)
+                .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3), // Header title
                     Constraint::Min(8),    // Table
