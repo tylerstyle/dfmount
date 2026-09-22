@@ -192,6 +192,30 @@ cmd_mount_evidence() {
     echo -e "${GREEN}${BOLD}[✓] Forensically mounted $dev at $mount_target (EVIDENCE SAFE: 0 writes / 0 journal replays)${NC}"
 }
 
+unblock_device_and_family() {
+    local dev="$1"
+    [[ -b "$dev" ]] || return 0
+
+    # 1. Unblock device itself
+    blockdev --setrw "$dev"
+
+    # 2. If partition, unblock parent disk (required by Linux kernel bdev_read_only)
+    local pkname
+    pkname=$(lsblk -no PKNAME "$dev" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ -n "$pkname" && -b "/dev/$pkname" ]]; then
+        blockdev --setrw "/dev/$pkname"
+    fi
+
+    # 3. If parent disk or container, unblock all child partitions
+    local child
+    while IFS= read -r child; do
+        [[ -z "$child" || "$child" == "$dev" ]] && continue
+        if [[ -b "$child" ]]; then
+            blockdev --setrw "$child"
+        fi
+    done < <(lsblk -rno PATH "$dev" 2>/dev/null || true)
+}
+
 cmd_unblock() {
     local dev="$1"
 
@@ -208,16 +232,9 @@ cmd_unblock() {
     echo -e "${YELLOW}[!] WARNING: You are unblocking $dev for WRITE ACCESS.${NC}"
     echo -e "${YELLOW}    Only do this for DESTINATION media (where dfdisk saves .E01 / .raw images).${NC}"
 
-    blockdev --setrw "$dev"
+    unblock_device_and_family "$dev"
 
-    # Also unblock parent disk if partition was given
-    local pkname
-    pkname=$(lsblk -no PKNAME "$dev" 2>/dev/null || true)
-    if [[ -n "$pkname" && -b "/dev/$pkname" ]]; then
-        blockdev --setrw "/dev/$pkname"
-    fi
-
-    echo -e "${RED}${BOLD}[✓] $dev is now UNBLOCKED (WRITABLE) for imaging with dfdisk.${NC}"
+    echo -e "${RED}${BOLD}[✓] $dev and associated parent/partitions are now UNBLOCKED (WRITABLE) for imaging with dfdisk.${NC}"
 }
 
 cmd_mount_target() {
@@ -234,13 +251,8 @@ cmd_mount_target() {
         exit 1
     fi
 
-    # Unblock block layer
-    blockdev --setrw "$dev"
-    local pkname
-    pkname=$(lsblk -no PKNAME "$dev" 2>/dev/null || true)
-    if [[ -n "$pkname" && -b "/dev/$pkname" ]]; then
-        blockdev --setrw "/dev/$pkname"
-    fi
+    # Unblock device, parent disk, and child partitions
+    unblock_device_and_family "$dev"
 
     local dev_name
     dev_name=$(basename "$dev")

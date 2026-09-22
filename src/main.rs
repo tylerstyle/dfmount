@@ -183,9 +183,34 @@ fn mount_evidence(dev: &str, target: Option<&str>) -> Result<String> {
     }
 }
 
-fn mount_target(dev: &str, target: Option<&str>) -> Result<String> {
-    // Unblock write access
+fn unblock_path_and_family(dev: &str) {
+    // 1. Unblock the target block device itself
     let _ = Command::new("blockdev").args(["--setrw", dev]).status();
+
+    // 2. If dev is a partition, unblock its parent disk (required by Linux kernel bdev_read_only)
+    if let Ok(output) = Command::new("lsblk").args(["-no", "PKNAME", dev]).output() {
+        let pkname = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !pkname.is_empty() {
+            let parent_path = format!("/dev/{}", pkname);
+            let _ = Command::new("blockdev").args(["--setrw", &parent_path]).status();
+        }
+    }
+
+    // 3. If dev is a parent disk or container, recursively unblock all child partitions
+    if let Ok(output) = Command::new("lsblk").args(["-rno", "PATH", dev]).output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let child_path = line.trim();
+            if !child_path.is_empty() && child_path != dev {
+                let _ = Command::new("blockdev").args(["--setrw", child_path]).status();
+            }
+        }
+    }
+}
+
+fn mount_target(dev: &str, target: Option<&str>) -> Result<String> {
+    // Unblock write access for device, parent disk, and child partitions
+    unblock_path_and_family(dev);
 
     let dev_name = std::path::Path::new(dev)
         .file_name()
@@ -211,12 +236,8 @@ fn mount_target(dev: &str, target: Option<&str>) -> Result<String> {
 }
 
 fn unblock_device(dev: &str) -> Result<String> {
-    let status = Command::new("blockdev").args(["--setrw", dev]).status()?;
-    if status.success() {
-        Ok(format!("UNBLOCKED: {} is now WRITABLE for raw disk cloning", dev))
-    } else {
-        anyhow::bail!("Failed to unblock {}", dev)
-    }
+    unblock_path_and_family(dev);
+    Ok(format!("UNBLOCKED: {} and associated parent/partitions are now WRITABLE", dev))
 }
 
 fn unmount_device(target: &str) -> Result<String> {
