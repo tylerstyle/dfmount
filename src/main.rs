@@ -69,10 +69,27 @@ struct FlatDevice {
     is_system: bool,
 }
 
+fn is_mount_system(m: &str) -> bool {
+    // Ignore desktop automounts under /run/media or /run/user
+    if m.starts_with("/run/media/") || m.starts_with("/run/user/") {
+        return false;
+    }
+    m == "/"
+        || m.starts_with("/boot")
+        || m.starts_with("/nix")
+        || m.starts_with("/iso")
+        || m.starts_with("/sysroot")
+        || m.starts_with("/run")
+        || m == "[SWAP]"
+}
+
 fn is_system_device(dev: &BlockDevice) -> bool {
+    if dev.label.as_deref() == Some("DFNIX_LIVE") {
+        return true;
+    }
     if let Some(mounts) = &dev.mountpoints {
         for m in mounts.iter().flatten() {
-            if m == "/" || m == "/boot" || m == "/nix" || m == "[SWAP]" || m.starts_with("/run") {
+            if is_mount_system(m) {
                 return true;
             }
         }
@@ -100,8 +117,8 @@ fn fetch_devices() -> Result<Vec<FlatDevice>> {
     let parsed: LsblkOutput = serde_json::from_slice(&output.stdout)?;
     let mut flat = Vec::new();
 
-    fn recurse(dev: &BlockDevice, level: usize, flat: &mut Vec<FlatDevice>) {
-        let is_sys = is_system_device(dev);
+    fn recurse(dev: &BlockDevice, level: usize, parent_is_sys: bool, flat: &mut Vec<FlatDevice>) {
+        let is_sys = parent_is_sys || is_system_device(dev);
         flat.push(FlatDevice {
             device: dev.clone(),
             level,
@@ -109,13 +126,13 @@ fn fetch_devices() -> Result<Vec<FlatDevice>> {
         });
         if let Some(children) = &dev.children {
             for c in children {
-                recurse(c, level + 1, flat);
+                recurse(c, level + 1, is_sys, flat);
             }
         }
     }
 
     for dev in &parsed.blockdevices {
-        recurse(dev, 0, &mut flat);
+        recurse(dev, 0, false, &mut flat);
     }
 
     Ok(flat)

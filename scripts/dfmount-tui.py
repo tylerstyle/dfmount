@@ -31,10 +31,26 @@ def get_block_devices():
         return []
 
 
+def check_mount_is_system(m):
+    if not m:
+        return False
+    if m.startswith("/run/media/") or m.startswith("/run/user/"):
+        return False
+    if m == "/" or m.startswith("/boot") or m.startswith("/nix") or m.startswith("/iso") or m.startswith("/sysroot") or m.startswith("/run") or m == "[SWAP]":
+        return True
+    return False
+
+
 def is_system_device(dev):
+    if not dev:
+        return False
+    if dev.get("is_system") is not None:
+        return dev.get("is_system")
+    if dev.get("label") == "DFNIX_LIVE":
+        return True
     mounts = dev.get("mountpoints") or []
     for m in mounts:
-        if m in ["/", "/boot", "/nix", "[SWAP]"] or (m and m.startswith("/run")):
+        if check_mount_is_system(m):
             return True
     for child in dev.get("children", []):
         if is_system_device(child):
@@ -42,12 +58,14 @@ def is_system_device(dev):
     return False
 
 
-def flatten_devices(dev_list, level=0):
+def flatten_devices(dev_list, level=0, parent_is_sys=False):
     flat = []
     for dev in dev_list:
+        sys_dev = parent_is_sys or is_system_device(dev)
+        dev["is_system"] = sys_dev
         flat.append((dev, level))
         for child in dev.get("children", []):
-            flat.extend(flatten_devices([child], level + 1))
+            flat.extend(flatten_devices([child], level + 1, parent_is_sys=sys_dev))
     return flat
 
 

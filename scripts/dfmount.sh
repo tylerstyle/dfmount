@@ -9,20 +9,43 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 is_system_device() {
     local dev="$1"
-    local mounts
-    mounts=$(lsblk -no MOUNTPOINTS "$dev" 2>/dev/null || true)
-    for m in $mounts; do
-        if [[ "$m" == "/" || "$m" == "/boot" || "$m" == "/nix" || "$m" == "/run"* || "$m" == "[SWAP]" ]]; then
+    [[ -b "$dev" ]] || return 1
+
+    # Check for live ISO boot media label
+    local label
+    label=$(lsblk -no LABEL "$dev" 2>/dev/null || true)
+    if [[ "$label" == "DFNIX_LIVE" ]]; then
+        return 0
+    fi
+
+    # Determine root parent disk if a partition was passed
+    local root_dev="$dev"
+    local pkname
+    pkname=$(lsblk -no PKNAME "$dev" 2>/dev/null || true)
+    while [[ -n "$pkname" && -b "/dev/$pkname" ]]; do
+        root_dev="/dev/$pkname"
+        pkname=$(lsblk -no PKNAME "$root_dev" 2>/dev/null || true)
+    done
+
+    # Inspect all mountpoints across the entire device hierarchy
+    local m
+    while IFS= read -r m; do
+        [[ -z "$m" ]] && continue
+        # Ignore desktop user automounts under /run/media or /run/user
+        if [[ "$m" == "/run/media/"* || "$m" == "/run/user/"* ]]; then
+            continue
+        fi
+        if [[ "$m" == "/" || "$m" == "/boot"* || "$m" == "/nix"* || "$m" == "/iso"* || "$m" == "/sysroot"* || "$m" == "/run"* || "$m" == "[SWAP]" ]]; then
             return 0
         fi
-    done
+    done < <(lsblk -no MOUNTPOINTS "$root_dev" 2>/dev/null)
+
     return 1
 }
 
@@ -31,10 +54,54 @@ cmd_status() {
     printf "%-12s %-6s %-8s %-10s %-18s %-22s %s\n" "DEVICE" "RO" "SIZE" "TYPE" "FSTYPE" "MOUNTPOINT" "MODEL / SERIAL"
     echo "------------------------------------------------------------------------------------------------------"
 
-    while read -r name ro size type fstype mountpoint model serial; do
+    local parse_stream
+    if command -v jq >/dev/null 2>&1; then
+        parse_stream='jq -r '\''
+            def walk_devs: .[] | (., (select(.children != null) | .children | walk_devs));
+            [.blockdevices | walk_devs] | .[] |
+            [
+                .name // "",
+                (if .ro then "1" else "0" end),
+                .size // "",
+                .type // "",
+                .fstype // "",
+                (.mountpoint // (.mountpoints[0] // "")),
+                .model // "",
+                .serial // ""
+            ] | map(tostring | gsub("\\|"; "/")) | join("|")
+        '\'
+    else
+        parse_stream='python3 -c '\''
+import sys, json
+data = json.load(sys.stdin)
+def walk(devs):
+    for d in devs:
+        mounts = d.get("mountpoints") or []
+        mp = d.get("mountpoint") or (mounts[0] if mounts else "")
+        ro = "1" if d.get("ro") else "0"
+        fields = [
+            d.get("name") or "",
+            ro,
+            d.get("size") or "",
+            d.get("type") or "",
+            d.get("fstype") or "",
+            mp,
+            d.get("model") or "",
+            d.get("serial") or ""
+        ]
+        clean_fields = [str(f).replace("|", "/") for f in fields]
+        print("|".join(clean_fields))
+        if "children" in d:
+            walk(d["children"])
+walk(data.get("blockdevices", []))
+'\'
+    fi
+
+    while IFS='|' read -r name ro size type fstype mountpoint model serial; do
+        [[ -z "$name" ]] && continue
         dev_path="/dev/$name"
         ro_status="${GREEN}RO (Locked)${NC}"
-        if [[ "$ro" == "0" ]]; then
+        if [[ "$ro" == "0" || "$ro" == "false" ]]; then
             ro_status="${RED}RW (Target)${NC}"
         fi
 
@@ -47,9 +114,14 @@ cmd_status() {
             tag=" ${RED}[TARGET]${NC}"
         fi
 
-        printf "%-12s %-15b %-8s %-10s %-18s %-31b %s %s\n" \
-            "$name" "$ro_status" "$size" "$type" "${fstype:--}" "${mountpoint:--}$tag" "${model:--}" "${serial:--}"
-    done < <(lsblk -rno NAME,RO,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL)
+        local model_serial=""
+        [[ -n "$model" ]] && model_serial="$model"
+        [[ -n "$serial" ]] && model_serial="${model_serial:+$model_serial }$serial"
+        [[ -z "$model_serial" ]] && model_serial="-"
+
+        printf "%-12s %-15b %-8s %-10s %-18s %-31b %s\n" \
+            "$name" "$ro_status" "$size" "$type" "${fstype:--}" "${mountpoint:--}$tag" "$model_serial"
+    done < <(lsblk -J -o NAME,RO,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL,SERIAL 2>/dev/null | eval "$parse_stream")
 }
 
 cmd_mount_evidence() {

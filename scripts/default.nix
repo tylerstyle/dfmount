@@ -5,6 +5,7 @@
 , gawk
 , gnugrep
 , coreutils
+, jq
 , python3
 , wrapGAppsHook4
 , gtk4
@@ -50,6 +51,7 @@ stdenv.mkDerivation rec {
         gawk
         gnugrep
         coreutils
+        jq
       ]}:$out/bin
 
     # 2. Install CLI script
@@ -62,6 +64,7 @@ stdenv.mkDerivation rec {
         gawk
         gnugrep
         coreutils
+        jq
       ]}
 
     # Compatibility symlinks
@@ -91,7 +94,7 @@ Version=1.0
 Name=dfmount Forensic Storage TUI
 GenericName=Forensic Disk Mounter
 Comment=Mount evidence write-blocked with zero journal replay or unblock target drives
-Exec=kitty --title "dfmount - Forensic Storage Manager" -e sudo dfmount
+Exec=kitty --title "dfmount - Forensic Storage Manager" sudo dfmount
 Icon=drive-harddisk-system
 Terminal=false
 Type=Application

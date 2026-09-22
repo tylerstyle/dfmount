@@ -38,10 +38,24 @@ def get_block_devices():
         return []
 
 
-def is_system_device(dev):
+def check_mount_is_system(m):
+    if not m:
+        return False
+    if m.startswith("/run/media/") or m.startswith("/run/user/"):
+        return False
+    if m == "/" or m.startswith("/boot") or m.startswith("/nix") or m.startswith("/iso") or m.startswith("/sysroot") or m.startswith("/run") or m == "[SWAP]":
+        return True
+    return False
+
+
+def is_system_device(dev, parent_is_sys=False):
+    if parent_is_sys:
+        return True
+    if dev.get("label") == "DFNIX_LIVE":
+        return True
     mounts = dev.get("mountpoints") or []
     for m in mounts:
-        if m in ["/", "/boot", "/nix", "[SWAP]"] or (m and m.startswith("/run")):
+        if check_mount_is_system(m):
             return True
     for child in dev.get("children", []):
         if is_system_device(child):
@@ -132,7 +146,7 @@ if HAS_GTK:
             for dev in devices:
                 self.add_device_rows(dev)
 
-        def add_device_rows(self, dev, level=0):
+        def add_device_rows(self, dev, level=0, parent_is_sys=False):
             name = dev.get("name", "")
             path = dev.get("path", f"/dev/{name}")
             size = dev.get("size", "")
@@ -143,7 +157,7 @@ if HAS_GTK:
             serial = dev.get("serial") or ""
             mounts = dev.get("mountpoints") or []
             mountpoint = ", ".join([m for m in mounts if m])
-            is_sys = is_system_device(dev)
+            is_sys = parent_is_sys or is_system_device(dev)
 
             row = Adw.ActionRow()
             indent = "    " * level
@@ -210,7 +224,7 @@ if HAS_GTK:
 
             # Recurse for partitions
             for child in dev.get("children", []):
-                self.add_device_rows(child, level=level + 1)
+                self.add_device_rows(child, level=level + 1, parent_is_sys=is_sys)
 
         def do_mount_evidence(self, path):
             code, out, err = run_cmd(f"sudo df-mount evidence {path}")
