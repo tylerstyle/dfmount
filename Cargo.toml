@@ -1,6 +1,6 @@
 [package]
 name = "dfmount"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic storage mounter, write-blocker and target unblocker TUI/CLI tool"
@@ -12,6 +12,7 @@ keywords = ["forensics", "dfir", "write-blocker", "mount", "tui"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+dfcore = { path = "../dfcore" }
 ratatui = "0.30"
 crossterm = "0.29"
 clap = { version = "4.6", features = ["derive", "cargo"] }

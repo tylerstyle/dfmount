@@ -7,9 +7,16 @@ use std::{
     io,
 };
 
+use dfcore::{
+    audit::{Event, Outcome},
+    protected::Registry,
+};
 use dfmount::{
     devices::{is_mount_system, parse_lsblk, FlatDevice},
-    ops::{apply_unblock, mount_evidence, mount_target, plan_unblock, unblock_device, UnblockMode},
+    ops::{
+        apply_unblock, mount_evidence, mount_target, plan_unblock, record_unconfirmed,
+        unblock_device, unmount_device, UnblockMode,
+    },
     sys::{CmdOutput, System},
 };
 
@@ -29,6 +36,8 @@ struct FakeHost {
     ro: RefCell<HashMap<String, bool>>,
     aliases: HashMap<String, String>,
     calls: RefCell<Vec<String>>,
+    registry: Option<Registry>,
+    events: RefCell<Vec<Event>>,
 }
 
 impl FakeHost {
@@ -52,6 +61,19 @@ impl FakeHost {
     fn alias(mut self, link: &str, target: &str) -> Self {
         self.aliases.insert(link.to_string(), target.to_string());
         self
+    }
+
+    fn with_registry(mut self, registry: Registry) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    fn events(&self) -> Vec<(String, Outcome)> {
+        self.events
+            .borrow()
+            .iter()
+            .map(|e| (e.action.clone(), e.outcome))
+            .collect()
     }
 
     fn calls(&self) -> Vec<String> {
@@ -97,6 +119,14 @@ impl System for FakeHost {
 
     fn create_dir_all(&self, _path: &str) -> io::Result<()> {
         Ok(())
+    }
+
+    fn protected_registry(&self) -> anyhow::Result<Option<Registry>> {
+        Ok(self.registry.clone())
+    }
+
+    fn audit(&self, event: Event) {
+        self.events.borrow_mut().push(event);
     }
 }
 
@@ -349,7 +379,7 @@ fn typed_confirmation_must_match_exactly() {
 fn unblock_sets_and_verifies_every_node() {
     let host = FakeHost::new();
     let plan = plan_unblock(&host, &lab(), "/dev/sdc", UnblockMode::Raw).unwrap();
-    unblock_device(&host, &plan).unwrap();
+    unblock_device(&host, &lab(), &plan).unwrap();
     for node in &plan.writable {
         assert_eq!(host.ro.borrow().get(node), Some(&false), "{node}");
     }
@@ -372,7 +402,7 @@ fn failed_setrw_rolls_back_to_read_only() {
 fn target_mount_unblocks_then_mounts_rw() {
     let host = FakeHost::new();
     let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
-    mount_target(&host, &plan, None).unwrap();
+    mount_target(&host, &lab(), &plan, None).unwrap();
     assert_eq!(host.mounts(), ["mount -o rw,noatime /dev/sdc1 /media/target/sdc1"]);
     let calls = host.calls();
     let mount_at = calls.iter().position(|c| c.starts_with("mount ")).unwrap();
@@ -385,6 +415,74 @@ fn target_mount_unblocks_then_mounts_rw() {
 fn target_is_not_mounted_when_unblock_fails() {
     let host = FakeHost::new().respond("blockdev --getro /dev/sdc1", 0, "1\n");
     let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
-    assert!(mount_target(&host, &plan, None).is_err());
+    assert!(mount_target(&host, &lab(), &plan, None).is_err());
     assert!(host.mounts().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Protected-device registry (dfcore) and audit trail
+// ---------------------------------------------------------------------------
+
+/// The lab tree after the system disk was unmounted (e.g. copy-to-RAM boot):
+/// nothing on it looks like the system any more.
+fn lab_unmounted() -> Vec<FlatDevice> {
+    let json = include_str!("fixtures/lsblk-lab.json")
+        .replace("\"mountpoints\":[\"/boot\"]", "\"mountpoints\":[null]")
+        .replace("\"mountpoints\":[\"/nix/store\", \"/\"]", "\"mountpoints\":[null]")
+        .replace("\"label\":\"DFNIX_LIVE\"", "\"label\":null");
+    parse_lsblk(json.as_bytes()).unwrap()
+}
+
+#[test]
+fn registry_protects_a_system_disk_that_no_longer_looks_like_one() {
+    let registry = Registry::build(&lab());
+    let flat = lab_unmounted();
+    assert!(flat.iter().all(|f| !f.is_system));
+    // Without the registry the old system disk would be fair game
+    assert!(plan_unblock(&FakeHost::new(), &flat, "/dev/nvme0n1p2", UnblockMode::Target).is_ok());
+
+    let host = FakeHost::new().with_registry(registry);
+    for dev in ["/dev/nvme0n1", "/dev/nvme0n1p2", "/dev/sr0"] {
+        let err = err_of(plan_unblock(&host, &flat, dev, UnblockMode::Raw));
+        assert!(err.contains("protected by the dfnix registry"), "{dev}: {err}");
+        assert!(err_of(mount_evidence(&host, &flat, dev, None)).contains("protected"), "{dev}");
+    }
+    assert!(host.calls().is_empty(), "{:?}", host.calls());
+    // Evidence and target disks are untouched by the registry
+    assert!(plan_unblock(&host, &flat, "/dev/sdc1", UnblockMode::Target).is_ok());
+}
+
+#[test]
+fn every_action_is_audited_with_its_outcome() {
+    let host = FakeHost::new()
+        .respond("blkid -p -o export /dev/sdb2", 0, "TYPE=ext4\n")
+        .respond("umount /media/evidence/sdb2", 1, "");
+    mount_evidence(&host, &lab(), "/dev/sdb2", None).unwrap();
+    let _ = mount_evidence(&host, &lab(), "/dev/nvme0n1p1", None);
+    let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
+    record_unconfirmed(&host, &lab(), &plan, "sdc");
+    mount_target(&host, &lab(), &plan, None).unwrap();
+    let _ = plan_unblock(&host, &lab(), "/dev/sdb2", UnblockMode::Target);
+    let _ = unmount_device(&host, "/media/evidence/sdb2");
+
+    assert_eq!(
+        host.events(),
+        [
+            ("evidence_mount".to_string(), Outcome::Ok),
+            ("evidence_mount".to_string(), Outcome::Refused),
+            ("unblock_refused".to_string(), Outcome::Refused),
+            ("target_mount".to_string(), Outcome::Ok),
+            ("unblock_refused".to_string(), Outcome::Refused),
+            ("umount".to_string(), Outcome::Error),
+        ]
+    );
+    let events = host.events.borrow();
+    let mount = &events[0];
+    assert_eq!(mount.device.as_ref().unwrap().path, "/dev/sdb2");
+    assert_eq!(mount.details["fstype"], "ext4");
+    assert_eq!(mount.details["ro_verified"], true);
+    assert_eq!(mount.details["disk"]["serial"], "WD-EVID001");
+    assert_eq!(events[2].details["typed"], "sdc");
+    assert_eq!(events[3].details["writable"], serde_json::json!(["/dev/sdc", "/dev/sdc1"]));
+    assert_eq!(events[3].details["mountpoint"], "/media/target/sdc1");
 }

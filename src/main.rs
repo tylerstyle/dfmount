@@ -2,7 +2,10 @@ use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use dfmount::{
     devices::{fetch_devices, FlatDevice},
-    ops::{mount_evidence, mount_target, plan_unblock, unblock_device, unmount_device, UnblockMode, UnblockPlan},
+    ops::{
+        mount_evidence, mount_target, plan_unblock, record_unconfirmed, unblock_device,
+        unmount_device, UnblockMode, UnblockPlan,
+    },
     sys::{RealSystem, System},
 };
 use crossterm::{
@@ -87,7 +90,7 @@ fn rescan_selected(sys: &dyn System, devices: &mut Vec<FlatDevice>, selected: &F
     Ok(path)
 }
 
-fn confirm_cli(plan: &UnblockPlan, confirm: Option<&str>) -> Result<()> {
+fn confirm_cli(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, confirm: Option<&str>) -> Result<()> {
     eprintln!("[!] {}", plan.summary());
     let typed = match confirm {
         Some(c) => c.to_string(),
@@ -101,6 +104,7 @@ fn confirm_cli(plan: &UnblockPlan, confirm: Option<&str>) -> Result<()> {
         None => bail!("stdin is not a terminal; pass --confirm {} to confirm", plan.confirm_name),
     };
     if !plan.confirms(&typed) {
+        record_unconfirmed(sys, flat, plan, &typed);
         bail!("Confirmation did not match '{}'; nothing was changed", plan.confirm_name);
     }
     Ok(())
@@ -272,11 +276,12 @@ fn run_tui() -> Result<()> {
                         KeyCode::Enter => {
                             let p = pending.take().unwrap();
                             let res = if !p.plan.confirms(&p.typed) {
+                                record_unconfirmed(&sys, &devices, &p.plan, &p.typed);
                                 Err(anyhow::anyhow!("Confirmation did not match '{}'; nothing was changed", p.plan.confirm_name))
                             } else {
                                 match p.kind {
-                                    PendingKind::Target => mount_target(&sys, &p.plan, None),
-                                    PendingKind::Unblock => unblock_device(&sys, &p.plan),
+                                    PendingKind::Target => mount_target(&sys, &devices, &p.plan, None),
+                                    PendingKind::Unblock => unblock_device(&sys, &devices, &p.plan),
                                 }
                             };
                             match res {
@@ -396,15 +401,15 @@ fn main() -> Result<()> {
         Some(Commands::Target { device, target, confirm }) => {
             let devs = fetch_devices(&sys)?;
             let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Target)?;
-            confirm_cli(&plan, confirm.as_deref())?;
-            let res = mount_target(&sys, &plan, target.as_deref())?;
+            confirm_cli(&sys, &devs, &plan, confirm.as_deref())?;
+            let res = mount_target(&sys, &devs, &plan, target.as_deref())?;
             println!("[✓] {}", res);
         }
         Some(Commands::Unblock { device, confirm }) => {
             let devs = fetch_devices(&sys)?;
             let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Raw)?;
-            confirm_cli(&plan, confirm.as_deref())?;
-            let res = unblock_device(&sys, &plan)?;
+            confirm_cli(&sys, &devs, &plan, confirm.as_deref())?;
+            let res = unblock_device(&sys, &devs, &plan)?;
             println!("[✓] {}", res);
         }
         Some(Commands::Umount { target }) => {

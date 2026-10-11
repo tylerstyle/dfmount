@@ -1,3 +1,4 @@
+use dfcore::{audit::Event, protected::Registry};
 use std::{
     io,
     process::{Command, Stdio},
@@ -24,6 +25,10 @@ pub trait System {
     /// Resolve symlinks such as /dev/disk/by-id/* or /dev/mapper/* to the kernel node.
     fn canonicalize(&self, path: &str) -> String;
     fn create_dir_all(&self, path: &str) -> io::Result<()>;
+    /// Boot-time protected-device registry; `None` outside dfnix.
+    fn protected_registry(&self) -> anyhow::Result<Option<Registry>>;
+    /// Record an action in the tamper-evident audit log.
+    fn audit(&self, event: Event);
 }
 
 pub struct RealSystem;
@@ -46,5 +51,16 @@ impl System for RealSystem {
 
     fn create_dir_all(&self, path: &str) -> io::Result<()> {
         std::fs::create_dir_all(path)
+    }
+
+    fn protected_registry(&self) -> anyhow::Result<Option<Registry>> {
+        Registry::load(&dfcore::protected::path())
+    }
+
+    fn audit(&self, event: Event) {
+        // The action already happened; a log failure must be loud, not fatal
+        if let Err(e) = dfcore::audit::append(event) {
+            eprintln!("[!] WARNING: audit log not written: {e:#}");
+        }
     }
 }

@@ -378,12 +378,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "dfmount"
+name = "dfcore"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "dfmount"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "dfcore",
  "ratatui",
  "serde",
  "serde_json",

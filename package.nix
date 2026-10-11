@@ -1,15 +1,32 @@
 { lib
 , rustPlatform
+, runCommand
 , makeWrapper
 , util-linux
 , coreutils
+  # dfcore is a sibling path dependency (../dfcore); flakes pass their input
+, dfcoreSrc ? ../dfcore
 }:
 
+let
+  clean = src: lib.cleanSourceWith {
+    filter = path: type: baseNameOf path != "target";
+    src = lib.cleanSource src;
+  };
+  # Lay out the sources as in ~/git so `path = "../dfcore"` resolves
+  src = runCommand "dfmount-src" { } ''
+    mkdir -p $out
+    cp -r ${clean ./.} $out/dfmount
+    cp -r ${clean dfcoreSrc} $out/dfcore
+    chmod -R u+w $out
+  '';
+in
 rustPlatform.buildRustPackage {
   pname = "dfmount";
-  version = "0.1.0";
+  version = "0.1.1";
 
-  src = lib.cleanSource ./.;
+  inherit src;
+  sourceRoot = "dfmount-src/dfmount";
 
   cargoLock = {
     lockFile = ./Cargo.lock;

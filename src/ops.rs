@@ -1,11 +1,53 @@
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
+use dfcore::audit::{Event, Outcome};
+use serde_json::{Map, Value};
+
 use crate::{
     devices::{descendants, is_evidence_mount, resolve_non_system, FlatDevice},
     probe::{mount_plan, parse_blkid},
     sys::System,
 };
+
+const TOOL: &str = "dfmount";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Append one audit record. The device is identified as lsblk reported it, with
+/// the whole disk alongside (partitions have no serial of their own).
+fn audit<T>(
+    sys: &dyn System,
+    action: &str,
+    flat: &[FlatDevice],
+    device: &str,
+    mut details: Map<String, Value>,
+    result: &Result<T>,
+) {
+    let want = sys.canonicalize(device);
+    let entry = flat
+        .iter()
+        .find(|f| sys.canonicalize(&f.device.dev_path()) == want);
+    details.insert("requested".into(), device.into());
+    if let Some(e) = entry {
+        if let Some(disk) = dfcore::lsblk::roots(flat, &e.device.dev_path()).first() {
+            if let Ok(v) = serde_json::to_value(disk.device.identity()) {
+                details.insert("disk".into(), v);
+            }
+        }
+    }
+    let mut event = Event::new(TOOL, VERSION, action).result(result);
+    if let Err(e) = result {
+        let text = format!("{e:#}");
+        if text.starts_with("ABORT") || text.contains("refusing") || text.contains("Confirmation") {
+            event.outcome = Outcome::Refused;
+        }
+    }
+    event.details = details;
+    if let Some(e) = entry {
+        event = event.device(e.device.identity());
+    }
+    sys.audit(event);
+}
 
 fn dev_basename(dev: &str, fallback: &str) -> String {
     Path::new(dev)
@@ -51,20 +93,36 @@ fn set_rw_verified(sys: &dyn System, dev: &str) -> Result<()> {
 
 /// Mount a device read-only without journal or log replay.
 pub fn mount_evidence(sys: &dyn System, flat: &[FlatDevice], device: &str, target: Option<&str>) -> Result<String> {
+    let mut details = Map::new();
+    let result = mount_evidence_steps(sys, flat, device, target, &mut details);
+    audit(sys, "evidence_mount", flat, device, details, &result);
+    result
+}
+
+fn mount_evidence_steps(
+    sys: &dyn System,
+    flat: &[FlatDevice],
+    device: &str,
+    target: Option<&str>,
+    details: &mut Map<String, Value>,
+) -> Result<String> {
     let hits = resolve_non_system(sys, flat, device)?;
     let dev = hits[0].device.dev_path();
 
     // 1. Kernel read-only flag, verified, before anything reads the device
     set_ro_verified(sys, &dev)?;
+    details.insert("ro_verified".into(), true.into());
 
     // 2. Low-level probe of the on-disk signature
     let probe = sys.run("blkid", &["-p", "-o", "export", &dev]).context("Failed to run blkid")?;
     let fstype = parse_blkid(&dev, probe.code, &probe.stdout)?;
+    details.insert("fstype".into(), fstype.clone().into());
     let plan = mount_plan(&fstype)?;
 
     let mnt_target = target
         .map(str::to_string)
         .unwrap_or_else(|| format!("/media/evidence/{}", dev_basename(&dev, "evidence")));
+    details.insert("mountpoint".into(), mnt_target.clone().into());
     sys.create_dir_all(&mnt_target)
         .with_context(|| format!("Failed to create mountpoint {}", mnt_target))?;
 
@@ -75,6 +133,8 @@ pub fn mount_evidence(sys: &dyn System, flat: &[FlatDevice], device: &str, targe
             .run("mount", &["-t", attempt.fstype, "-o", &attempt.options, &dev, &mnt_target])
             .context("Failed to run mount")?;
         if out.success() {
+            details.insert("driver".into(), attempt.fstype.into());
+            details.insert("options".into(), attempt.options.clone().into());
             return Ok(format!(
                 "Forensically mounted {} ({}) at {} [{}]",
                 dev, attempt.fstype, mnt_target, attempt.options
@@ -125,6 +185,17 @@ impl UnblockPlan {
 /// Work out which nodes a target/unblock would make writable, and refuse when
 /// that would expose system or evidence media.
 pub fn plan_unblock(sys: &dyn System, flat: &[FlatDevice], device: &str, mode: UnblockMode) -> Result<UnblockPlan> {
+    let result = plan_unblock_checked(sys, flat, device, mode);
+    // A plan changes nothing; only refusals are worth a record
+    if result.is_err() {
+        let mut details = Map::new();
+        details.insert("mode".into(), format!("{mode:?}").into());
+        audit(sys, "unblock_refused", flat, device, details, &result);
+    }
+    result
+}
+
+fn plan_unblock_checked(sys: &dyn System, flat: &[FlatDevice], device: &str, mode: UnblockMode) -> Result<UnblockPlan> {
     let hits = resolve_non_system(sys, flat, device)?;
     let dev = hits[0].device.dev_path();
 
@@ -209,17 +280,51 @@ pub fn apply_unblock(sys: &dyn System, plan: &UnblockPlan) -> Result<()> {
     Ok(())
 }
 
-pub fn unblock_device(sys: &dyn System, plan: &UnblockPlan) -> Result<String> {
-    apply_unblock(sys, plan)?;
-    Ok(format!("UNBLOCKED (WRITABLE): {}", plan.writable.join(", ")))
+fn plan_details(plan: &UnblockPlan) -> Map<String, Value> {
+    let mut details = Map::new();
+    details.insert("writable".into(), plan.writable.clone().into());
+    details.insert("exposed".into(), plan.exposed.clone().into());
+    details.insert("confirmed_as".into(), plan.confirm_name.clone().into());
+    details
 }
 
-pub fn mount_target(sys: &dyn System, plan: &UnblockPlan, target: Option<&str>) -> Result<String> {
+/// Record that the examiner did not confirm a write-enabling action.
+pub fn record_unconfirmed(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, typed: &str) {
+    let mut details = plan_details(plan);
+    details.insert("typed".into(), typed.trim().into());
+    let refused: Result<()> = Err(anyhow::anyhow!(
+        "Confirmation did not match '{}'; nothing was changed",
+        plan.confirm_name
+    ));
+    audit(sys, "unblock_refused", flat, &plan.device, details, &refused);
+}
+
+pub fn unblock_device(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan) -> Result<String> {
+    let result = apply_unblock(sys, plan)
+        .map(|()| format!("UNBLOCKED (WRITABLE): {}", plan.writable.join(", ")));
+    audit(sys, "unblock", flat, &plan.device, plan_details(plan), &result);
+    result
+}
+
+pub fn mount_target(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, target: Option<&str>) -> Result<String> {
+    let mut details = plan_details(plan);
+    let result = mount_target_steps(sys, plan, target, &mut details);
+    audit(sys, "target_mount", flat, &plan.device, details, &result);
+    result
+}
+
+fn mount_target_steps(
+    sys: &dyn System,
+    plan: &UnblockPlan,
+    target: Option<&str>,
+    details: &mut Map<String, Value>,
+) -> Result<String> {
     apply_unblock(sys, plan)?;
 
     let mnt_target = target
         .map(str::to_string)
         .unwrap_or_else(|| format!("/media/target/{}", dev_basename(&plan.device, "target")));
+    details.insert("mountpoint".into(), mnt_target.clone().into());
     sys.create_dir_all(&mnt_target)
         .with_context(|| format!("Failed to create mountpoint {}", mnt_target))?;
 
@@ -234,6 +339,16 @@ pub fn mount_target(sys: &dyn System, plan: &UnblockPlan, target: Option<&str>) 
 }
 
 pub fn unmount_device(sys: &dyn System, target: &str) -> Result<String> {
+    let result = unmount_steps(sys, target);
+    sys.audit(
+        Event::new(TOOL, VERSION, "umount")
+            .result(&result)
+            .detail("target", target),
+    );
+    result
+}
+
+fn unmount_steps(sys: &dyn System, target: &str) -> Result<String> {
     let _ = sys.run("sync", &[]);
     let out = sys.run("umount", &[target])?;
     let _ = sys.run("sync", &[]);
