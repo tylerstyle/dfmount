@@ -33,7 +33,10 @@ pub fn parse_blkid(dev: &str, code: Option<i32>, stdout: &str) -> Result<String>
 
     let fstype = match field("TYPE") {
         Some(t) if !t.is_empty() => t.to_lowercase(),
-        _ => bail!("{}: blkid -p reported no filesystem TYPE; refusing to mount", dev),
+        _ => bail!(
+            "{}: blkid -p reported no filesystem TYPE; refusing to mount",
+            dev
+        ),
     };
 
     match field("USAGE").as_deref() {
@@ -92,7 +95,10 @@ mod tests {
 
     #[test]
     fn blkid_type_is_lowercased() {
-        assert_eq!(parse_blkid("/dev/sdb1", Some(0), "TYPE=NTFS\n").unwrap(), "ntfs");
+        assert_eq!(
+            parse_blkid("/dev/sdb1", Some(0), "TYPE=NTFS\n").unwrap(),
+            "ntfs"
+        );
     }
 
     #[test]
@@ -104,13 +110,17 @@ mod tests {
 
     #[test]
     fn blkid_nothing_detected_is_refused() {
-        let err = parse_blkid("/dev/sdb1", Some(2), "").unwrap_err().to_string();
+        let err = parse_blkid("/dev/sdb1", Some(2), "")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no filesystem signature"), "{err}");
     }
 
     #[test]
     fn blkid_ambiguous_is_refused() {
-        let err = parse_blkid("/dev/sdb1", Some(8), "").unwrap_err().to_string();
+        let err = parse_blkid("/dev/sdb1", Some(8), "")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("ambiguous"), "{err}");
     }
 
@@ -153,7 +163,9 @@ mod tests {
     #[test]
     fn xfs_and_btrfs_suppress_log_replay() {
         assert!(mount_plan("xfs").unwrap()[0].options.contains("norecovery"));
-        assert!(mount_plan("btrfs").unwrap()[0].options.contains("rescue=nologreplay"));
+        assert!(mount_plan("btrfs").unwrap()[0]
+            .options
+            .contains("rescue=nologreplay"));
     }
 
     #[test]
@@ -168,7 +180,10 @@ mod tests {
 
     #[test]
     fn every_plan_is_read_only_and_hardened() {
-        for fs in ["ext2", "ext3", "ext4", "xfs", "btrfs", "ntfs", "vfat", "exfat", "hfsplus", "iso9660", "udf"] {
+        for fs in [
+            "ext2", "ext3", "ext4", "xfs", "btrfs", "ntfs", "vfat", "exfat", "hfsplus", "iso9660",
+            "udf",
+        ] {
             for a in mount_plan(fs).unwrap() {
                 let opts: Vec<_> = a.options.split(',').collect();
                 for required in ["ro", "noatime", "nodev", "nosuid", "noexec"] {

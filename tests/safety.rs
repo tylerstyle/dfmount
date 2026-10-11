@@ -48,7 +48,11 @@ impl FakeHost {
     fn respond(mut self, cmd: &str, code: i32, stdout: &str) -> Self {
         self.responses.insert(
             cmd.to_string(),
-            CmdOutput { code: Some(code), stdout: stdout.to_string(), stderr: String::new() },
+            CmdOutput {
+                code: Some(code),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            },
         );
         self
     }
@@ -81,21 +85,35 @@ impl FakeHost {
     }
 
     fn mounts(&self) -> Vec<String> {
-        self.calls().into_iter().filter(|c| c.starts_with("mount ")).collect()
+        self.calls()
+            .into_iter()
+            .filter(|c| c.starts_with("mount "))
+            .collect()
     }
 }
 
 impl System for FakeHost {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
-        let line = std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
+        let line = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
         self.calls.borrow_mut().push(line.clone());
         if self.failing.contains(&line) {
-            return Ok(CmdOutput { code: Some(1), stdout: String::new(), stderr: "simulated failure".into() });
+            return Ok(CmdOutput {
+                code: Some(1),
+                stdout: String::new(),
+                stderr: "simulated failure".into(),
+            });
         }
         if let Some(r) = self.responses.get(&line) {
             return Ok(r.clone());
         }
-        let ok = |stdout: &str| CmdOutput { code: Some(0), stdout: stdout.into(), stderr: String::new() };
+        let ok = |stdout: &str| CmdOutput {
+            code: Some(0),
+            stdout: stdout.into(),
+            stderr: String::new(),
+        };
         Ok(match (program, args) {
             ("blockdev", ["--setro", dev]) => {
                 self.ro.borrow_mut().insert(dev.to_string(), true);
@@ -114,7 +132,10 @@ impl System for FakeHost {
     }
 
     fn canonicalize(&self, path: &str) -> String {
-        self.aliases.get(path).cloned().unwrap_or_else(|| path.to_string())
+        self.aliases
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.to_string())
     }
 
     fn create_dir_all(&self, _path: &str) -> io::Result<()> {
@@ -140,10 +161,25 @@ fn err_of<T: std::fmt::Debug>(r: anyhow::Result<T>) -> String {
 
 #[test]
 fn system_mountpoints() {
-    for m in ["/", "/boot", "/boot/efi", "/nix/store", "/iso", "/sysroot", "/run/initramfs", "[SWAP]"] {
+    for m in [
+        "/",
+        "/boot",
+        "/boot/efi",
+        "/nix/store",
+        "/iso",
+        "/sysroot",
+        "/run/initramfs",
+        "[SWAP]",
+    ] {
         assert!(is_mount_system(m), "{m}");
     }
-    for m in ["/run/media/nixos/STICK", "/run/user/1000/gvfs", "/media/evidence/sdb1", "/media/target/sdh1", "/mnt"] {
+    for m in [
+        "/run/media/nixos/STICK",
+        "/run/user/1000/gvfs",
+        "/media/evidence/sdb1",
+        "/media/target/sdh1",
+        "/mnt",
+    ] {
         assert!(!is_mount_system(m), "{m}");
     }
 }
@@ -151,7 +187,11 @@ fn system_mountpoints() {
 #[test]
 fn whole_system_disk_and_live_media_are_protected() {
     let flat = lab();
-    let sys_names: Vec<_> = flat.iter().filter(|f| f.is_system).map(|f| f.device.name.as_str()).collect();
+    let sys_names: Vec<_> = flat
+        .iter()
+        .filter(|f| f.is_system)
+        .map(|f| f.device.name.as_str())
+        .collect();
     assert_eq!(sys_names, ["nvme0n1", "nvme0n1p1", "nvme0n1p2", "sr0"]);
 }
 
@@ -162,8 +202,15 @@ fn tree_levels_and_ancestors() {
     assert_eq!(luks.level, 2);
     assert_eq!(luks.ancestors, ["/dev/sdc", "/dev/sdc2"]);
     // A RAID array shows up once under each member
-    let md: Vec<_> = flat.iter().filter(|f| f.device.name == "md0").map(|f| f.ancestors.clone()).collect();
-    assert_eq!(md, [vec!["/dev/sdf", "/dev/sdf1"], vec!["/dev/sdg", "/dev/sdg1"]]);
+    let md: Vec<_> = flat
+        .iter()
+        .filter(|f| f.device.name == "md0")
+        .map(|f| f.ancestors.clone())
+        .collect();
+    assert_eq!(
+        md,
+        [vec!["/dev/sdf", "/dev/sdf1"], vec!["/dev/sdg", "/dev/sdg1"]]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -173,11 +220,26 @@ fn tree_levels_and_ancestors() {
 #[test]
 fn system_devices_are_refused_by_every_write_path() {
     let flat = lab();
-    for dev in ["/dev/nvme0n1", "/dev/nvme0n1p1", "/dev/nvme0n1p2", "/dev/sr0"] {
+    for dev in [
+        "/dev/nvme0n1",
+        "/dev/nvme0n1p1",
+        "/dev/nvme0n1p2",
+        "/dev/sr0",
+    ] {
         let host = FakeHost::new();
-        assert!(err_of(mount_evidence(&host, &flat, dev, None)).contains("operating system"), "{dev}");
-        assert!(err_of(plan_unblock(&host, &flat, dev, UnblockMode::Target)).contains("operating system"), "{dev}");
-        assert!(err_of(plan_unblock(&host, &flat, dev, UnblockMode::Raw)).contains("operating system"), "{dev}");
+        assert!(
+            err_of(mount_evidence(&host, &flat, dev, None)).contains("operating system"),
+            "{dev}"
+        );
+        assert!(
+            err_of(plan_unblock(&host, &flat, dev, UnblockMode::Target))
+                .contains("operating system"),
+            "{dev}"
+        );
+        assert!(
+            err_of(plan_unblock(&host, &flat, dev, UnblockMode::Raw)).contains("operating system"),
+            "{dev}"
+        );
         assert!(host.calls().is_empty(), "{dev}: {:?}", host.calls());
     }
 }
@@ -185,8 +247,16 @@ fn system_devices_are_refused_by_every_write_path() {
 #[test]
 fn system_guard_follows_symlinks() {
     let flat = lab();
-    let host = FakeHost::new().alias("/dev/disk/by-id/nvme-Samsung_SSD_990-part2", "/dev/nvme0n1p2");
-    let err = err_of(plan_unblock(&host, &flat, "/dev/disk/by-id/nvme-Samsung_SSD_990-part2", UnblockMode::Raw));
+    let host = FakeHost::new().alias(
+        "/dev/disk/by-id/nvme-Samsung_SSD_990-part2",
+        "/dev/nvme0n1p2",
+    );
+    let err = err_of(plan_unblock(
+        &host,
+        &flat,
+        "/dev/disk/by-id/nvme-Samsung_SSD_990-part2",
+        UnblockMode::Raw,
+    ));
     assert!(err.contains("operating system"), "{err}");
 }
 
@@ -198,7 +268,12 @@ fn desktop_automount_is_not_treated_as_system() {
 
 #[test]
 fn unknown_device_is_refused() {
-    let err = err_of(plan_unblock(&FakeHost::new(), &lab(), "/dev/sdz", UnblockMode::Raw));
+    let err = err_of(plan_unblock(
+        &FakeHost::new(),
+        &lab(),
+        "/dev/sdz",
+        UnblockMode::Raw,
+    ));
     assert!(err.contains("not a block device"), "{err}");
 }
 
@@ -208,7 +283,11 @@ fn unknown_device_is_refused() {
 
 #[test]
 fn evidence_mount_sequence_for_ext4() {
-    let host = FakeHost::new().respond("blkid -p -o export /dev/sdb2", 0, "TYPE=ext4\nUSAGE=filesystem\n");
+    let host = FakeHost::new().respond(
+        "blkid -p -o export /dev/sdb2",
+        0,
+        "TYPE=ext4\nUSAGE=filesystem\n",
+    );
     let msg = mount_evidence(&host, &lab(), "/dev/sdb2", None).unwrap();
     assert!(msg.contains("/media/evidence/sdb2"), "{msg}");
     assert_eq!(
@@ -247,10 +326,22 @@ fn unreadable_getro_aborts() {
 
 #[test]
 fn ambiguous_or_missing_signature_is_not_mounted() {
-    for (code, stdout) in [(8, ""), (2, ""), (0, "TYPE=apfs\nUSAGE=filesystem\n"), (0, "TYPE=crypto_LUKS\nUSAGE=crypto\n")] {
+    for (code, stdout) in [
+        (8, ""),
+        (2, ""),
+        (0, "TYPE=apfs\nUSAGE=filesystem\n"),
+        (0, "TYPE=crypto_LUKS\nUSAGE=crypto\n"),
+    ] {
         let host = FakeHost::new().respond("blkid -p -o export /dev/sdb2", code, stdout);
-        assert!(mount_evidence(&host, &lab(), "/dev/sdb2", None).is_err(), "{code} {stdout}");
-        assert!(host.mounts().is_empty(), "{code} {stdout}: {:?}", host.mounts());
+        assert!(
+            mount_evidence(&host, &lab(), "/dev/sdb2", None).is_err(),
+            "{code} {stdout}"
+        );
+        assert!(
+            host.mounts().is_empty(),
+            "{code} {stdout}: {:?}",
+            host.mounts()
+        );
         // The device was still locked first
         assert_eq!(host.calls()[0], "blockdev --setro /dev/sdb2");
     }
@@ -259,7 +350,11 @@ fn ambiguous_or_missing_signature_is_not_mounted() {
 #[test]
 fn ntfs_falls_back_to_ntfs3g_never_to_untyped_mount() {
     let host = FakeHost::new()
-        .respond("blkid -p -o export /dev/sdb2", 0, "TYPE=ntfs\nUSAGE=filesystem\n")
+        .respond(
+            "blkid -p -o export /dev/sdb2",
+            0,
+            "TYPE=ntfs\nUSAGE=filesystem\n",
+        )
         .fail("mount -t ntfs3 -o ro,noatime,nodev,nosuid,noexec /dev/sdb2 /media/evidence/sdb2");
     let msg = mount_evidence(&host, &lab(), "/dev/sdb2", None).unwrap();
     assert!(msg.contains("ntfs-3g"), "{msg}");
@@ -287,7 +382,10 @@ fn ntfs_with_both_drivers_failing_reports_both() {
 fn evidence_mount_honours_custom_mountpoint() {
     let host = FakeHost::new().respond("blkid -p -o export /dev/sdb2", 0, "TYPE=xfs\n");
     mount_evidence(&host, &lab(), "/dev/sdb2", Some("/mnt/case42")).unwrap();
-    assert_eq!(host.mounts(), ["mount -t xfs -o ro,noatime,nodev,nosuid,noexec,norecovery /dev/sdb2 /mnt/case42"]);
+    assert_eq!(
+        host.mounts(),
+        ["mount -t xfs -o ro,noatime,nodev,nosuid,noexec,norecovery /dev/sdb2 /mnt/case42"]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -319,7 +417,12 @@ fn blank_disk_unblock() {
 
 #[test]
 fn partition_next_to_mounted_evidence_is_refused() {
-    let err = err_of(plan_unblock(&FakeHost::new(), &lab(), "/dev/sdb2", UnblockMode::Target));
+    let err = err_of(plan_unblock(
+        &FakeHost::new(),
+        &lab(),
+        "/dev/sdb2",
+        UnblockMode::Target,
+    ));
     assert!(err.contains("also holds evidence /dev/sdb1"), "{err}");
 }
 
@@ -333,13 +436,23 @@ fn disk_hosting_evidence_is_refused() {
 
 #[test]
 fn evidence_mount_itself_cannot_become_target() {
-    let err = err_of(plan_unblock(&FakeHost::new(), &lab(), "/dev/sdb1", UnblockMode::Target));
+    let err = err_of(plan_unblock(
+        &FakeHost::new(),
+        &lab(),
+        "/dev/sdb1",
+        UnblockMode::Target,
+    ));
     assert!(err.contains("mounted as evidence"), "{err}");
 }
 
 #[test]
 fn raw_unblock_requires_everything_unmounted() {
-    let err = err_of(plan_unblock(&FakeHost::new(), &lab(), "/dev/sdh", UnblockMode::Raw));
+    let err = err_of(plan_unblock(
+        &FakeHost::new(),
+        &lab(),
+        "/dev/sdh",
+        UnblockMode::Raw,
+    ));
     assert!(err.contains("unmount"), "{err}");
     // A second filesystem next to a mounted target is fine
     let plan = plan_unblock(&FakeHost::new(), &lab(), "/dev/sdh2", UnblockMode::Target).unwrap();
@@ -348,17 +461,25 @@ fn raw_unblock_requires_everything_unmounted() {
 
 #[test]
 fn mapped_device_resolves_through_alias_and_unblocks_backing_chain() {
-    let host = FakeHost::new().alias("/dev/mapper/luks-tgt", "/dev/dm-0").alias("/dev/dm-0", "/dev/dm-0");
+    let host = FakeHost::new()
+        .alias("/dev/mapper/luks-tgt", "/dev/dm-0")
+        .alias("/dev/dm-0", "/dev/dm-0");
     let plan = plan_unblock(&host, &lab(), "/dev/dm-0", UnblockMode::Target).unwrap();
     assert_eq!(plan.confirm_name, "luks-tgt");
-    assert_eq!(plan.writable, ["/dev/sdc", "/dev/sdc2", "/dev/mapper/luks-tgt"]);
+    assert_eq!(
+        plan.writable,
+        ["/dev/sdc", "/dev/sdc2", "/dev/mapper/luks-tgt"]
+    );
     assert_eq!(plan.exposed, ["/dev/sdc1"]);
 }
 
 #[test]
 fn array_spanning_disks_lists_every_member() {
     let plan = plan_unblock(&FakeHost::new(), &lab(), "/dev/md0", UnblockMode::Target).unwrap();
-    assert_eq!(plan.writable, ["/dev/sdf", "/dev/sdf1", "/dev/sdg", "/dev/sdg1", "/dev/md0"]);
+    assert_eq!(
+        plan.writable,
+        ["/dev/sdf", "/dev/sdf1", "/dev/sdg", "/dev/sdg1", "/dev/md0"]
+    );
 }
 
 #[test]
@@ -383,7 +504,9 @@ fn unblock_sets_and_verifies_every_node() {
     for node in &plan.writable {
         assert_eq!(host.ro.borrow().get(node), Some(&false), "{node}");
     }
-    assert!(host.calls().contains(&"blockdev --getro /dev/sdc2".to_string()));
+    assert!(host
+        .calls()
+        .contains(&"blockdev --getro /dev/sdc2".to_string()));
 }
 
 #[test]
@@ -395,7 +518,10 @@ fn failed_setrw_rolls_back_to_read_only() {
     for node in ["/dev/sdc", "/dev/sdc1"] {
         assert_eq!(host.ro.borrow().get(node), Some(&true), "{node}");
     }
-    assert!(!host.calls().iter().any(|c| c == "blockdev --setrw /dev/sdc2"));
+    assert!(!host
+        .calls()
+        .iter()
+        .any(|c| c == "blockdev --setrw /dev/sdc2"));
 }
 
 #[test]
@@ -403,7 +529,10 @@ fn target_mount_unblocks_then_mounts_rw() {
     let host = FakeHost::new();
     let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
     mount_target(&host, &lab(), &plan, None).unwrap();
-    assert_eq!(host.mounts(), ["mount -o rw,noatime /dev/sdc1 /media/target/sdc1"]);
+    assert_eq!(
+        host.mounts(),
+        ["mount -o rw,noatime /dev/sdc1 /media/target/sdc1"]
+    );
     let calls = host.calls();
     let mount_at = calls.iter().position(|c| c.starts_with("mount ")).unwrap();
     assert!(calls[..mount_at].contains(&"blockdev --setrw /dev/sdc".to_string()));
@@ -428,7 +557,10 @@ fn target_is_not_mounted_when_unblock_fails() {
 fn lab_unmounted() -> Vec<FlatDevice> {
     let json = include_str!("fixtures/lsblk-lab.json")
         .replace("\"mountpoints\":[\"/boot\"]", "\"mountpoints\":[null]")
-        .replace("\"mountpoints\":[\"/nix/store\", \"/\"]", "\"mountpoints\":[null]")
+        .replace(
+            "\"mountpoints\":[\"/nix/store\", \"/\"]",
+            "\"mountpoints\":[null]",
+        )
         .replace("\"label\":\"DFNIX_LIVE\"", "\"label\":null");
     parse_lsblk(json.as_bytes()).unwrap()
 }
@@ -439,13 +571,25 @@ fn registry_protects_a_system_disk_that_no_longer_looks_like_one() {
     let flat = lab_unmounted();
     assert!(flat.iter().all(|f| !f.is_system));
     // Without the registry the old system disk would be fair game
-    assert!(plan_unblock(&FakeHost::new(), &flat, "/dev/nvme0n1p2", UnblockMode::Target).is_ok());
+    assert!(plan_unblock(
+        &FakeHost::new(),
+        &flat,
+        "/dev/nvme0n1p2",
+        UnblockMode::Target
+    )
+    .is_ok());
 
     let host = FakeHost::new().with_registry(registry);
     for dev in ["/dev/nvme0n1", "/dev/nvme0n1p2", "/dev/sr0"] {
         let err = err_of(plan_unblock(&host, &flat, dev, UnblockMode::Raw));
-        assert!(err.contains("protected by the dfnix registry"), "{dev}: {err}");
-        assert!(err_of(mount_evidence(&host, &flat, dev, None)).contains("protected"), "{dev}");
+        assert!(
+            err.contains("protected by the dfnix registry"),
+            "{dev}: {err}"
+        );
+        assert!(
+            err_of(mount_evidence(&host, &flat, dev, None)).contains("protected"),
+            "{dev}"
+        );
     }
     assert!(host.calls().is_empty(), "{:?}", host.calls());
     // Evidence and target disks are untouched by the registry
@@ -460,15 +604,25 @@ fn every_action_is_audited_with_its_outcome() {
     mount_evidence(&host, &lab(), "/dev/sdb2", None).unwrap();
     let _ = mount_evidence(&host, &lab(), "/dev/nvme0n1p1", None);
     // A container is declined before anything is mounted: refused, not an error
-    let host_luks = FakeHost::new().respond("blkid -p -o export /dev/sdc2", 0, "TYPE=crypto_LUKS\nUSAGE=crypto\n");
+    let host_luks = FakeHost::new().respond(
+        "blkid -p -o export /dev/sdc2",
+        0,
+        "TYPE=crypto_LUKS\nUSAGE=crypto\n",
+    );
     let _ = mount_evidence(&host_luks, &lab(), "/dev/sdc2", None);
-    assert_eq!(host_luks.events(), [("evidence_mount".to_string(), Outcome::Refused)]);
+    assert_eq!(
+        host_luks.events(),
+        [("evidence_mount".to_string(), Outcome::Refused)]
+    );
     // A mount that is attempted and fails is an error
     let host_fail = FakeHost::new()
         .respond("blkid -p -o export /dev/sdb2", 0, "TYPE=xfs\n")
         .fail("mount -t xfs -o ro,noatime,nodev,nosuid,noexec,norecovery /dev/sdb2 /media/evidence/sdb2");
     let _ = mount_evidence(&host_fail, &lab(), "/dev/sdb2", None);
-    assert_eq!(host_fail.events(), [("evidence_mount".to_string(), Outcome::Error)]);
+    assert_eq!(
+        host_fail.events(),
+        [("evidence_mount".to_string(), Outcome::Error)]
+    );
     let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
     record_unconfirmed(&host, &lab(), &plan, "sdc");
     mount_target(&host, &lab(), &plan, None).unwrap();
@@ -493,6 +647,9 @@ fn every_action_is_audited_with_its_outcome() {
     assert_eq!(mount.details["ro_verified"], true);
     assert_eq!(mount.details["disk"]["serial"], "WD-EVID001");
     assert_eq!(events[2].details["typed"], "sdc");
-    assert_eq!(events[3].details["writable"], serde_json::json!(["/dev/sdc", "/dev/sdc1"]));
+    assert_eq!(
+        events[3].details["writable"],
+        serde_json::json!(["/dev/sdc", "/dev/sdc1"])
+    );
     assert_eq!(events[3].details["mountpoint"], "/media/target/sdc1");
 }

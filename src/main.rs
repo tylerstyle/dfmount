@@ -1,5 +1,10 @@
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use dfmount::{
     devices::{fetch_devices, FlatDevice},
     ops::{
@@ -7,11 +12,6 @@ use dfmount::{
         unmount_device, UnblockMode, UnblockPlan,
     },
     sys::{RealSystem, System},
-};
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -28,7 +28,11 @@ use std::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "dfmount", version, about = "Modern Forensic Storage Mounter & Target Unblocker TUI")]
+#[command(
+    name = "dfmount",
+    version,
+    about = "Modern Forensic Storage Mounter & Target Unblocker TUI"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -39,7 +43,10 @@ enum Commands {
     /// Print connected storage matrix and read-only status
     Status,
     /// Mount partition write-blocked with zero journal replay
-    Evidence { device: String, target: Option<String> },
+    Evidence {
+        device: String,
+        target: Option<String>,
+    },
     /// Mount target drive writeable for dfdisk output
     Target {
         device: String,
@@ -74,10 +81,20 @@ struct Pending {
 
 /// Rescan before acting so a key press never lands on a drive that was swapped
 /// in under the same kernel name since the table was drawn.
-fn rescan_selected(sys: &dyn System, devices: &mut Vec<FlatDevice>, selected: &FlatDevice) -> Result<String> {
+fn rescan_selected(
+    sys: &dyn System,
+    devices: &mut Vec<FlatDevice>,
+    selected: &FlatDevice,
+) -> Result<String> {
     let path = selected.device.dev_path();
     let fresh = fetch_devices(sys)?;
-    let identity = |f: &FlatDevice| (f.device.serial.clone(), f.device.model.clone(), f.device.size.clone());
+    let identity = |f: &FlatDevice| {
+        (
+            f.device.serial.clone(),
+            f.device.model.clone(),
+            f.device.size.clone(),
+        )
+    };
     let unchanged = fresh
         .iter()
         .find(|f| f.device.dev_path() == path)
@@ -85,12 +102,20 @@ fn rescan_selected(sys: &dyn System, devices: &mut Vec<FlatDevice>, selected: &F
         == Some(identity(selected));
     *devices = fresh;
     if !unchanged {
-        bail!("{} changed since the last scan (hotplug?). Table refreshed, check the selection.", path);
+        bail!(
+            "{} changed since the last scan (hotplug?). Table refreshed, check the selection.",
+            path
+        );
     }
     Ok(path)
 }
 
-fn confirm_cli(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, confirm: Option<&str>) -> Result<()> {
+fn confirm_cli(
+    sys: &dyn System,
+    flat: &[FlatDevice],
+    plan: &UnblockPlan,
+    confirm: Option<&str>,
+) -> Result<()> {
     eprintln!("[!] {}", plan.summary());
     let typed = match confirm {
         Some(c) => c.to_string(),
@@ -101,11 +126,17 @@ fn confirm_cli(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, confir
             io::stdin().lock().read_line(&mut line)?;
             line
         }
-        None => bail!("stdin is not a terminal; pass --confirm {} to confirm", plan.confirm_name),
+        None => bail!(
+            "stdin is not a terminal; pass --confirm {} to confirm",
+            plan.confirm_name
+        ),
     };
     if !plan.confirms(&typed) {
         record_unconfirmed(sys, flat, plan, &typed);
-        bail!("Confirmation did not match '{}'; nothing was changed", plan.confirm_name);
+        bail!(
+            "Confirmation did not match '{}'; nothing was changed",
+            plan.confirm_name
+        );
     }
     Ok(())
 }
@@ -140,10 +171,19 @@ fn run_tui() -> Result<()> {
 
             // 1. Header
             let title = Paragraph::new(Line::from(vec![
-                Span::styled(" dfmount ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " dfmount ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("— Forensic Media Mounter & Ingestion Manager (dfnix)"),
             ]))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             f.render_widget(title, chunks[0]);
 
             // 2. Storage Table
@@ -151,7 +191,8 @@ fn run_tui() -> Result<()> {
                 .iter()
                 .map(|fdev| {
                     let dev = &fdev.device;
-                    let indent = "  ".repeat(fdev.level) + if fdev.level > 0 { "└─ " } else { "" };
+                    let indent =
+                        "  ".repeat(fdev.level) + if fdev.level > 0 { "└─ " } else { "" };
                     let name = format!("{}{}", indent, dev.name);
                     let size = dev.size.clone().unwrap_or_default();
                     let fstype = dev.fstype.clone().unwrap_or_else(|| "-".to_string());
@@ -165,11 +206,31 @@ fn run_tui() -> Result<()> {
                     let ro = dev.ro.unwrap_or(false);
 
                     let (ro_text, ro_color, role_text) = if fdev.is_system {
-                        ("[SYSTEM]", Color::Magenta, format!("{} (SYS PROTECT)", mountpoint))
+                        (
+                            "[SYSTEM]",
+                            Color::Magenta,
+                            format!("{} (SYS PROTECT)", mountpoint),
+                        )
                     } else if ro {
-                        ("🔒 RO-LOCKED", Color::Green, if mountpoint != "-" { format!("{} (EVIDENCE)", mountpoint) } else { "UNMOUNTED (SAFE)".to_string() })
+                        (
+                            "🔒 RO-LOCKED",
+                            Color::Green,
+                            if mountpoint != "-" {
+                                format!("{} (EVIDENCE)", mountpoint)
+                            } else {
+                                "UNMOUNTED (SAFE)".to_string()
+                            },
+                        )
                     } else {
-                        ("💾 RW-TARGET", Color::Red, if mountpoint != "-" { format!("{} (TARGET)", mountpoint) } else { "UNBLOCKED (RW)".to_string() })
+                        (
+                            "💾 RW-TARGET",
+                            Color::Red,
+                            if mountpoint != "-" {
+                                format!("{} (TARGET)", mountpoint)
+                            } else {
+                                "UNBLOCKED (RW)".to_string()
+                            },
+                        )
                     };
 
                     let model_serial = format!(
@@ -183,7 +244,10 @@ fn run_tui() -> Result<()> {
                     Row::new(vec![
                         Span::raw(name),
                         Span::raw(size),
-                        Span::styled(ro_text, Style::default().fg(ro_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            ro_text,
+                            Style::default().fg(ro_color).add_modifier(Modifier::BOLD),
+                        ),
                         Span::raw(fstype),
                         Span::raw(role_text),
                         Span::raw(model_serial),
@@ -192,12 +256,42 @@ fn run_tui() -> Result<()> {
                 .collect();
 
             let header_row = Row::new(vec![
-                Span::styled("DEVICE", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("SIZE", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("STATUS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("FS", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("MOUNTPOINT / ROLE", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled("MODEL / SERIAL", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "DEVICE",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "SIZE",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "STATUS",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "FS",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "MOUNTPOINT / ROLE",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "MODEL / SERIAL",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]);
 
             let table = Table::new(
@@ -212,49 +306,115 @@ fn run_tui() -> Result<()> {
                 ],
             )
             .header(header_row)
-            .block(Block::default().borders(Borders::ALL).title(" Storage Devices ").border_style(Style::default().fg(Color::DarkGray)))
-            .row_highlight_style(Style::default().bg(Color::Rgb(30, 45, 55)).fg(Color::White).add_modifier(Modifier::BOLD));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Storage Devices ")
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .bg(Color::Rgb(30, 45, 55))
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            );
 
             f.render_stateful_widget(table, chunks[1], &mut table_state);
 
             // 3. Status Box
             let status_line = match &pending {
                 Some(p) => Line::from(vec![
-                    Span::styled(" CONFIRM ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                     Span::styled(
-                        format!("{}. Type '{}' + Enter to proceed, Esc to cancel: ", p.plan.summary(), p.plan.confirm_name),
+                        " CONFIRM ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(
+                            "{}. Type '{}' + Enter to proceed, Esc to cancel: ",
+                            p.plan.summary(),
+                            p.plan.confirm_name
+                        ),
                         Style::default().fg(Color::Yellow),
                     ),
-                    Span::styled(p.typed.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        p.typed.clone(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ]),
                 None => {
                     let status_color = if is_error { Color::Red } else { Color::Green };
                     Line::from(vec![
-                        Span::styled(" >> ", Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            " >> ",
+                            Style::default()
+                                .fg(status_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(status_msg.clone(), Style::default().fg(status_color)),
                     ])
                 }
             };
-            let status_p = Paragraph::new(status_line)
-                .wrap(Wrap { trim: true })
-                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            let status_p = Paragraph::new(status_line).wrap(Wrap { trim: true }).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            );
             f.render_widget(status_p, chunks[2]);
 
             // 4. Hotkeys Footer
             let footer = Paragraph::new(Line::from(vec![
-                Span::styled(" [E] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [E] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Evid-RO  "),
-                Span::styled(" [T] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [T] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Target-RW  "),
-                Span::styled(" [U] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [U] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Unblock  "),
-                Span::styled(" [X] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [X] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Umount  "),
-                Span::styled(" [D] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [D] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("dfdisk  "),
-                Span::styled(" [R] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [R] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Rescan  "),
-                Span::styled(" [Q] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " [Q] ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("Quit "),
             ]));
             f.render_widget(footer, chunks[3]);
@@ -277,16 +437,27 @@ fn run_tui() -> Result<()> {
                             let p = pending.take().unwrap();
                             let res = if !p.plan.confirms(&p.typed) {
                                 record_unconfirmed(&sys, &devices, &p.plan, &p.typed);
-                                Err(anyhow::anyhow!("Confirmation did not match '{}'; nothing was changed", p.plan.confirm_name))
+                                Err(anyhow::anyhow!(
+                                    "Confirmation did not match '{}'; nothing was changed",
+                                    p.plan.confirm_name
+                                ))
                             } else {
                                 match p.kind {
-                                    PendingKind::Target => mount_target(&sys, &devices, &p.plan, None),
+                                    PendingKind::Target => {
+                                        mount_target(&sys, &devices, &p.plan, None)
+                                    }
                                     PendingKind::Unblock => unblock_device(&sys, &devices, &p.plan),
                                 }
                             };
                             match res {
-                                Ok(msg) => { status_msg = msg; is_error = false; }
-                                Err(e) => { status_msg = format!("{:#}", e); is_error = true; }
+                                Ok(msg) => {
+                                    status_msg = msg;
+                                    is_error = false;
+                                }
+                                Err(e) => {
+                                    status_msg = format!("{:#}", e);
+                                    is_error = true;
+                                }
                             }
                             devices = fetch_devices(&sys).unwrap_or_default();
                         }
@@ -298,15 +469,21 @@ fn run_tui() -> Result<()> {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Up | KeyCode::Char('k') => {
                         let i = match table_state.selected() {
-                            Some(i) => if i > 0 { i - 1 } else { devices.len().saturating_sub(1) },
+                            Some(i) => {
+                                if i > 0 {
+                                    i - 1
+                                } else {
+                                    devices.len().saturating_sub(1)
+                                }
+                            }
                             None => 0,
                         };
                         table_state.select(Some(i));
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         let i = match table_state.selected() {
-                            Some(i) => if i < devices.len().saturating_sub(1) { i + 1 } else { 0 },
-                            None => 0,
+                            Some(i) if i < devices.len().saturating_sub(1) => i + 1,
+                            Some(_) | None => 0,
                         };
                         table_state.select(Some(i));
                     }
@@ -316,37 +493,69 @@ fn run_tui() -> Result<()> {
                         is_error = false;
                     }
                     KeyCode::Char(c @ ('e' | 't' | 'u')) => {
-                        let Some(selected) = table_state.selected().and_then(|i| devices.get(i)).cloned() else {
+                        let Some(selected) =
+                            table_state.selected().and_then(|i| devices.get(i)).cloned()
+                        else {
                             continue;
                         };
-                        let res = rescan_selected(&sys, &mut devices, &selected).and_then(|path| match c {
-                            'e' => {
-                                let msg = mount_evidence(&sys, &devices, &path, None);
-                                devices = fetch_devices(&sys).unwrap_or_default();
-                                msg.map(Some)
-                            }
-                            't' => plan_unblock(&sys, &devices, &path, UnblockMode::Target).map(|plan| {
-                                pending = Some(Pending { kind: PendingKind::Target, plan, typed: String::new() });
-                                None
-                            }),
-                            _ => plan_unblock(&sys, &devices, &path, UnblockMode::Raw).map(|plan| {
-                                pending = Some(Pending { kind: PendingKind::Unblock, plan, typed: String::new() });
-                                None
-                            }),
-                        });
+                        let res =
+                            rescan_selected(&sys, &mut devices, &selected).and_then(
+                                |path| match c {
+                                    'e' => {
+                                        let msg = mount_evidence(&sys, &devices, &path, None);
+                                        devices = fetch_devices(&sys).unwrap_or_default();
+                                        msg.map(Some)
+                                    }
+                                    't' => plan_unblock(&sys, &devices, &path, UnblockMode::Target)
+                                        .map(|plan| {
+                                            pending = Some(Pending {
+                                                kind: PendingKind::Target,
+                                                plan,
+                                                typed: String::new(),
+                                            });
+                                            None
+                                        }),
+                                    _ => plan_unblock(&sys, &devices, &path, UnblockMode::Raw).map(
+                                        |plan| {
+                                            pending = Some(Pending {
+                                                kind: PendingKind::Unblock,
+                                                plan,
+                                                typed: String::new(),
+                                            });
+                                            None
+                                        },
+                                    ),
+                                },
+                            );
                         match res {
-                            Ok(Some(msg)) => { status_msg = msg; is_error = false; }
+                            Ok(Some(msg)) => {
+                                status_msg = msg;
+                                is_error = false;
+                            }
                             Ok(None) => {}
-                            Err(e) => { status_msg = format!("{:#}", e); is_error = true; }
+                            Err(e) => {
+                                status_msg = format!("{:#}", e);
+                                is_error = true;
+                            }
                         }
                     }
                     KeyCode::Char('x') => {
                         if let Some(idx) = table_state.selected() {
                             if let Some(fdev) = devices.get(idx) {
-                                let path = fdev.device.path.clone().unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
+                                let path = fdev
+                                    .device
+                                    .path
+                                    .clone()
+                                    .unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
                                 match unmount_device(&sys, &path) {
-                                    Ok(msg) => { status_msg = msg; is_error = false; }
-                                    Err(e) => { status_msg = e.to_string(); is_error = true; }
+                                    Ok(msg) => {
+                                        status_msg = msg;
+                                        is_error = false;
+                                    }
+                                    Err(e) => {
+                                        status_msg = e.to_string();
+                                        is_error = true;
+                                    }
                                 }
                                 devices = fetch_devices(&sys).unwrap_or_default();
                             }
@@ -379,7 +588,10 @@ fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Status) => {
             let devs = fetch_devices(&sys)?;
-            println!("{:<14} {:<8} {:<12} {:<8} {:<24} MODEL / SERIAL", "DEVICE", "SIZE", "STATUS", "FS", "MOUNTPOINT");
+            println!(
+                "{:<14} {:<8} {:<12} {:<8} {:<24} MODEL / SERIAL",
+                "DEVICE", "SIZE", "STATUS", "FS", "MOUNTPOINT"
+            );
             println!("{}", "-".repeat(80));
             for fdev in devs {
                 let dev = &fdev.device;
@@ -388,9 +600,18 @@ fn main() -> Result<()> {
                 let size = dev.size.as_deref().unwrap_or("-");
                 let fstype = dev.fstype.as_deref().unwrap_or("-");
                 let ro = dev.ro.unwrap_or(false);
-                let status = if fdev.is_system { "[SYSTEM]" } else if ro { "RO-LOCKED" } else { "RW-TARGET" };
+                let status = if fdev.is_system {
+                    "[SYSTEM]"
+                } else if ro {
+                    "RO-LOCKED"
+                } else {
+                    "RW-TARGET"
+                };
                 let mount = dev.mounts().next().unwrap_or("-");
-                println!("{:<14} {:<8} {:<12} {:<8} {:<24}", name, size, status, fstype, mount);
+                println!(
+                    "{:<14} {:<8} {:<12} {:<8} {:<24}",
+                    name, size, status, fstype, mount
+                );
             }
         }
         Some(Commands::Evidence { device, target }) => {
@@ -398,7 +619,11 @@ fn main() -> Result<()> {
             let res = mount_evidence(&sys, &devs, &device, target.as_deref())?;
             println!("[✓] {}", res);
         }
-        Some(Commands::Target { device, target, confirm }) => {
+        Some(Commands::Target {
+            device,
+            target,
+            confirm,
+        }) => {
             let devs = fetch_devices(&sys)?;
             let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Target)?;
             confirm_cli(&sys, &devs, &plan, confirm.as_deref())?;

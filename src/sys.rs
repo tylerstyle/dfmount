@@ -35,7 +35,10 @@ pub struct RealSystem;
 
 impl System for RealSystem {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<CmdOutput> {
-        let out = Command::new(program).args(args).stdin(Stdio::null()).output()?;
+        let out = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()?;
         Ok(CmdOutput {
             code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
