@@ -15,6 +15,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Append one audit record. The device is identified as lsblk reported it, with
 /// the whole disk alongside (partitions have no serial of their own).
+/// `refusal`: whether a failure means dfmount declined before changing anything
+/// (as opposed to an operation that was attempted and failed).
 fn audit<T>(
     sys: &dyn System,
     action: &str,
@@ -22,6 +24,7 @@ fn audit<T>(
     device: &str,
     mut details: Map<String, Value>,
     result: &Result<T>,
+    refusal: bool,
 ) {
     let want = sys.canonicalize(device);
     let entry = flat
@@ -36,11 +39,8 @@ fn audit<T>(
         }
     }
     let mut event = Event::new(TOOL, VERSION, action).result(result);
-    if let Err(e) = result {
-        let text = format!("{e:#}");
-        if text.starts_with("ABORT") || text.contains("refusing") || text.contains("Confirmation") {
-            event.outcome = Outcome::Refused;
-        }
+    if result.is_err() && refusal {
+        event.outcome = Outcome::Refused;
     }
     event.details = details;
     if let Some(e) = entry {
@@ -95,7 +95,9 @@ fn set_rw_verified(sys: &dyn System, dev: &str) -> Result<()> {
 pub fn mount_evidence(sys: &dyn System, flat: &[FlatDevice], device: &str, target: Option<&str>) -> Result<String> {
     let mut details = Map::new();
     let result = mount_evidence_steps(sys, flat, device, target, &mut details);
-    audit(sys, "evidence_mount", flat, device, details, &result);
+    // Guards, read-only lock, probe and filesystem checks all run before any mount
+    let refusal = !details.contains_key("mount_attempted");
+    audit(sys, "evidence_mount", flat, device, details, &result, refusal);
     result
 }
 
@@ -127,6 +129,7 @@ fn mount_evidence_steps(
         .with_context(|| format!("Failed to create mountpoint {}", mnt_target))?;
 
     // 3. Only the replay-safe attempts for this filesystem; no generic fallback
+    details.insert("mount_attempted".into(), true.into());
     let mut errors = Vec::new();
     for attempt in &plan {
         let out = sys
@@ -190,7 +193,7 @@ pub fn plan_unblock(sys: &dyn System, flat: &[FlatDevice], device: &str, mode: U
     if result.is_err() {
         let mut details = Map::new();
         details.insert("mode".into(), format!("{mode:?}").into());
-        audit(sys, "unblock_refused", flat, device, details, &result);
+        audit(sys, "unblock_refused", flat, device, details, &result, true);
     }
     result
 }
@@ -296,20 +299,20 @@ pub fn record_unconfirmed(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockP
         "Confirmation did not match '{}'; nothing was changed",
         plan.confirm_name
     ));
-    audit(sys, "unblock_refused", flat, &plan.device, details, &refused);
+    audit(sys, "unblock_refused", flat, &plan.device, details, &refused, true);
 }
 
 pub fn unblock_device(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan) -> Result<String> {
     let result = apply_unblock(sys, plan)
         .map(|()| format!("UNBLOCKED (WRITABLE): {}", plan.writable.join(", ")));
-    audit(sys, "unblock", flat, &plan.device, plan_details(plan), &result);
+    audit(sys, "unblock", flat, &plan.device, plan_details(plan), &result, false);
     result
 }
 
 pub fn mount_target(sys: &dyn System, flat: &[FlatDevice], plan: &UnblockPlan, target: Option<&str>) -> Result<String> {
     let mut details = plan_details(plan);
     let result = mount_target_steps(sys, plan, target, &mut details);
-    audit(sys, "target_mount", flat, &plan.device, details, &result);
+    audit(sys, "target_mount", flat, &plan.device, details, &result, false);
     result
 }
 

@@ -459,6 +459,16 @@ fn every_action_is_audited_with_its_outcome() {
         .respond("umount /media/evidence/sdb2", 1, "");
     mount_evidence(&host, &lab(), "/dev/sdb2", None).unwrap();
     let _ = mount_evidence(&host, &lab(), "/dev/nvme0n1p1", None);
+    // A container is declined before anything is mounted: refused, not an error
+    let host_luks = FakeHost::new().respond("blkid -p -o export /dev/sdc2", 0, "TYPE=crypto_LUKS\nUSAGE=crypto\n");
+    let _ = mount_evidence(&host_luks, &lab(), "/dev/sdc2", None);
+    assert_eq!(host_luks.events(), [("evidence_mount".to_string(), Outcome::Refused)]);
+    // A mount that is attempted and fails is an error
+    let host_fail = FakeHost::new()
+        .respond("blkid -p -o export /dev/sdb2", 0, "TYPE=xfs\n")
+        .fail("mount -t xfs -o ro,noatime,nodev,nosuid,noexec,norecovery /dev/sdb2 /media/evidence/sdb2");
+    let _ = mount_evidence(&host_fail, &lab(), "/dev/sdb2", None);
+    assert_eq!(host_fail.events(), [("evidence_mount".to_string(), Outcome::Error)]);
     let plan = plan_unblock(&host, &lab(), "/dev/sdc1", UnblockMode::Target).unwrap();
     record_unconfirmed(&host, &lab(), &plan, "sdc");
     mount_target(&host, &lab(), &plan, None).unwrap();
