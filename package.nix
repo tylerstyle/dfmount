@@ -18,11 +18,9 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ makeWrapper ];
 
   postInstall = ''
-    # Install companion CLI helper
-    cp scripts/dfmount.sh $out/bin/dfmount-cli
-    chmod +x $out/bin/dfmount-cli
-
-    # Compatibility symlinks
+    # Compatibility symlinks (dfmount-cli used to be a separate shell script;
+    # it now runs the Rust binary so every entry point shares its safety checks)
+    ln -s $out/bin/dfmount $out/bin/dfmount-cli
     ln -s $out/bin/dfmount $out/bin/df-mount
     ln -s $out/bin/dfmount $out/bin/df-status
     ln -s $out/bin/dfmount $out/bin/df-unblock
@@ -30,9 +28,6 @@ rustPlatform.buildRustPackage {
     ln -s $out/bin/dfmount $out/bin/df-umount
 
     wrapProgram $out/bin/dfmount \
-      --prefix PATH : ${lib.makeBinPath [ util-linux coreutils ]}
-
-    wrapProgram $out/bin/dfmount-cli \
       --prefix PATH : ${lib.makeBinPath [ util-linux coreutils ]}
 
     # Desktop launcher entry

@@ -1,5 +1,10 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
+use dfmount::{
+    devices::{fetch_devices, FlatDevice},
+    ops::{mount_evidence, mount_target, plan_unblock, unblock_device, unmount_device, UnblockMode, UnblockPlan},
+    sys::{RealSystem, System},
+};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -10,12 +15,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Paragraph, Row, Table, TableState, Wrap},
     Terminal,
 };
-use serde::{Deserialize, Serialize};
 use std::{
-    io,
+    io::{self, BufRead, IsTerminal, Write},
     process::Command,
     time::Duration,
 };
@@ -34,224 +38,76 @@ enum Commands {
     /// Mount partition write-blocked with zero journal replay
     Evidence { device: String, target: Option<String> },
     /// Mount target drive writeable for dfdisk output
-    Target { device: String, target: Option<String> },
+    Target {
+        device: String,
+        target: Option<String>,
+        /// Kernel name of the device (e.g. sdc1), required when stdin is not a terminal
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     /// Unblock raw block device for direct disk cloning
-    Unblock { device: String },
+    Unblock {
+        device: String,
+        /// Kernel name of the device (e.g. sdc), required when stdin is not a terminal
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     /// Safely flush and unmount partition
     Umount { target: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockDevice {
-    name: String,
-    path: Option<String>,
-    size: Option<String>,
-    ro: Option<bool>,
-    #[serde(rename = "type")]
-    dev_type: Option<String>,
-    fstype: Option<String>,
-    label: Option<String>,
-    mountpoints: Option<Vec<Option<String>>>,
-    model: Option<String>,
-    serial: Option<String>,
-    children: Option<Vec<BlockDevice>>,
+#[derive(Debug, Clone, Copy)]
+enum PendingKind {
+    Target,
+    Unblock,
 }
 
-#[derive(Debug, Deserialize)]
-struct LsblkOutput {
-    blockdevices: Vec<BlockDevice>,
+/// A write-enabling action waiting for the examiner to type the device name
+struct Pending {
+    kind: PendingKind,
+    plan: UnblockPlan,
+    typed: String,
 }
 
-#[derive(Debug, Clone)]
-struct FlatDevice {
-    device: BlockDevice,
-    level: usize,
-    is_system: bool,
-}
-
-fn is_mount_system(m: &str) -> bool {
-    // Ignore desktop automounts under /run/media or /run/user
-    if m.starts_with("/run/media/") || m.starts_with("/run/user/") {
-        return false;
+/// Rescan before acting so a key press never lands on a drive that was swapped
+/// in under the same kernel name since the table was drawn.
+fn rescan_selected(sys: &dyn System, devices: &mut Vec<FlatDevice>, selected: &FlatDevice) -> Result<String> {
+    let path = selected.device.dev_path();
+    let fresh = fetch_devices(sys)?;
+    let identity = |f: &FlatDevice| (f.device.serial.clone(), f.device.model.clone(), f.device.size.clone());
+    let unchanged = fresh
+        .iter()
+        .find(|f| f.device.dev_path() == path)
+        .map(identity)
+        == Some(identity(selected));
+    *devices = fresh;
+    if !unchanged {
+        bail!("{} changed since the last scan (hotplug?). Table refreshed, check the selection.", path);
     }
-    m == "/"
-        || m.starts_with("/boot")
-        || m.starts_with("/nix")
-        || m.starts_with("/iso")
-        || m.starts_with("/sysroot")
-        || m.starts_with("/run")
-        || m == "[SWAP]"
+    Ok(path)
 }
 
-fn is_system_device(dev: &BlockDevice) -> bool {
-    if dev.label.as_deref() == Some("DFNIX_LIVE") {
-        return true;
-    }
-    if let Some(mounts) = &dev.mountpoints {
-        for m in mounts.iter().flatten() {
-            if is_mount_system(m) {
-                return true;
-            }
+fn confirm_cli(plan: &UnblockPlan, confirm: Option<&str>) -> Result<()> {
+    eprintln!("[!] {}", plan.summary());
+    let typed = match confirm {
+        Some(c) => c.to_string(),
+        None if io::stdin().is_terminal() => {
+            eprint!("[?] Type '{}' to confirm: ", plan.confirm_name);
+            io::stderr().flush()?;
+            let mut line = String::new();
+            io::stdin().lock().read_line(&mut line)?;
+            line
         }
-    }
-    if let Some(children) = &dev.children {
-        for c in children {
-            if is_system_device(c) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn fetch_devices() -> Result<Vec<FlatDevice>> {
-    let output = Command::new("lsblk")
-        .args(["-J", "-o", "NAME,PATH,SIZE,RO,TYPE,FSTYPE,LABEL,MOUNTPOINTS,MODEL,SERIAL"])
-        .output()
-        .context("Failed to run lsblk")?;
-
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let parsed: LsblkOutput = serde_json::from_slice(&output.stdout)?;
-    let mut flat = Vec::new();
-
-    fn recurse(dev: &BlockDevice, level: usize, parent_is_sys: bool, flat: &mut Vec<FlatDevice>) {
-        let is_sys = parent_is_sys || is_system_device(dev);
-        flat.push(FlatDevice {
-            device: dev.clone(),
-            level,
-            is_system: is_sys,
-        });
-        if let Some(children) = &dev.children {
-            for c in children {
-                recurse(c, level + 1, is_sys, flat);
-            }
-        }
-    }
-
-    for dev in &parsed.blockdevices {
-        recurse(dev, 0, false, &mut flat);
-    }
-
-    Ok(flat)
-}
-
-fn mount_evidence(dev: &str, target: Option<&str>) -> Result<String> {
-    // 1. Force driver read-only
-    let _ = Command::new("blockdev").args(["--setro", dev]).status();
-
-    // 2. Identify filesystem
-    let blkid_out = Command::new("blkid").args(["-o", "value", "-s", "TYPE", dev]).output();
-    let fstype = blkid_out
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase())
-        .unwrap_or_default();
-
-    let dev_name = std::path::Path::new(dev)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "evidence".to_string());
-
-    let mnt_target = target
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| format!("/media/evidence/{}", dev_name));
-
-    let _ = std::fs::create_dir_all(&mnt_target);
-
-    // Zero-journal replay flags based on filesystem
-    let (fstype_arg, opts) = match fstype.as_str() {
-        "ext3" | "ext4" => (fstype.as_str(), "ro,noload,noatime,nodev,nosuid,noexec"),
-        "xfs" => ("xfs", "ro,norecovery,noatime,nodev,nosuid,noexec"),
-        "btrfs" => ("btrfs", "ro,rescue=nologreplay,noatime,nodev,nosuid,noexec"),
-        "ntfs" => ("ntfs3", "ro,norecover,noatime,nodev,nosuid,noexec"),
-        _ => ("", "ro,noatime,nodev,nosuid,noexec"),
+        None => bail!("stdin is not a terminal; pass --confirm {} to confirm", plan.confirm_name),
     };
-
-    let mut cmd = Command::new("mount");
-    if !fstype_arg.is_empty() {
-        cmd.args(["-t", fstype_arg]);
+    if !plan.confirms(&typed) {
+        bail!("Confirmation did not match '{}'; nothing was changed", plan.confirm_name);
     }
-    cmd.args(["-o", opts, dev, &mnt_target]);
-
-    let status = cmd.status().context("Failed to mount evidence device")?;
-    if status.success() {
-        Ok(format!("Forensically mounted {} at {} (0 writes / 0 journal replays)", dev, mnt_target))
-    } else {
-        anyhow::bail!("Mount command exited with failure for {}", dev)
-    }
-}
-
-fn unblock_path_and_family(dev: &str) {
-    // 1. Unblock the target block device itself
-    let _ = Command::new("blockdev").args(["--setrw", dev]).status();
-
-    // 2. If dev is a partition, unblock its parent disk (required by Linux kernel bdev_read_only)
-    if let Ok(output) = Command::new("lsblk").args(["-no", "PKNAME", dev]).output() {
-        let pkname = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !pkname.is_empty() {
-            let parent_path = format!("/dev/{}", pkname);
-            let _ = Command::new("blockdev").args(["--setrw", &parent_path]).status();
-        }
-    }
-
-    // 3. If dev is a parent disk or container, recursively unblock all child partitions
-    if let Ok(output) = Command::new("lsblk").args(["-rno", "PATH", dev]).output() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let child_path = line.trim();
-            if !child_path.is_empty() && child_path != dev {
-                let _ = Command::new("blockdev").args(["--setrw", child_path]).status();
-            }
-        }
-    }
-}
-
-fn mount_target(dev: &str, target: Option<&str>) -> Result<String> {
-    // Unblock write access for device, parent disk, and child partitions
-    unblock_path_and_family(dev);
-
-    let dev_name = std::path::Path::new(dev)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "target".to_string());
-
-    let mnt_target = target
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| format!("/media/target/{}", dev_name));
-
-    let _ = std::fs::create_dir_all(&mnt_target);
-
-    let status = Command::new("mount")
-        .args(["-o", "rw,noatime", dev, &mnt_target])
-        .status()
-        .context("Failed to mount target drive")?;
-
-    if status.success() {
-        Ok(format!("Mounted TARGET {} at {} for dfdisk output", dev, mnt_target))
-    } else {
-        anyhow::bail!("Target mount command failed for {}", dev)
-    }
-}
-
-fn unblock_device(dev: &str) -> Result<String> {
-    unblock_path_and_family(dev);
-    Ok(format!("UNBLOCKED: {} and associated parent/partitions are now WRITABLE", dev))
-}
-
-fn unmount_device(target: &str) -> Result<String> {
-    let _ = Command::new("sync").status();
-    let status = Command::new("umount").arg(target).status()?;
-    let _ = Command::new("sync").status();
-    if status.success() {
-        Ok(format!("Safely flushed and unmounted {}", target))
-    } else {
-        anyhow::bail!("Failed to unmount {}", target)
-    }
+    Ok(())
 }
 
 fn run_tui() -> Result<()> {
+    let sys = RealSystem;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -261,9 +117,10 @@ fn run_tui() -> Result<()> {
     let mut table_state = TableState::default();
     table_state.select(Some(0));
 
-    let mut devices = fetch_devices().unwrap_or_default();
+    let mut devices = fetch_devices(&sys).unwrap_or_default();
     let mut status_msg = String::from("Ready. Select device with j/k or ↑/↓ and choose an action.");
     let mut is_error = false;
+    let mut pending: Option<Pending> = None;
 
     loop {
         terminal.draw(|f| {
@@ -272,7 +129,7 @@ fn run_tui() -> Result<()> {
                 .constraints([
                     Constraint::Length(3), // Header title
                     Constraint::Min(8),    // Table
-                    Constraint::Length(3), // Status message
+                    Constraint::Length(5), // Status message / confirmation prompt
                     Constraint::Length(2), // Bottom hotkey bar
                 ])
                 .split(f.area());
@@ -357,12 +214,26 @@ fn run_tui() -> Result<()> {
             f.render_stateful_widget(table, chunks[1], &mut table_state);
 
             // 3. Status Box
-            let status_color = if is_error { Color::Red } else { Color::Green };
-            let status_p = Paragraph::new(Line::from(vec![
-                Span::styled(" >> ", Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
-                Span::styled(&status_msg, Style::default().fg(status_color)),
-            ]))
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
+            let status_line = match &pending {
+                Some(p) => Line::from(vec![
+                    Span::styled(" CONFIRM ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{}. Type '{}' + Enter to proceed, Esc to cancel: ", p.plan.summary(), p.plan.confirm_name),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(p.typed.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                ]),
+                None => {
+                    let status_color = if is_error { Color::Red } else { Color::Green };
+                    Line::from(vec![
+                        Span::styled(" >> ", Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(status_msg.clone(), Style::default().fg(status_color)),
+                    ])
+                }
+            };
+            let status_p = Paragraph::new(status_line)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
             f.render_widget(status_p, chunks[2]);
 
             // 4. Hotkeys Footer
@@ -387,6 +258,37 @@ fn run_tui() -> Result<()> {
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
+                if let Some(p) = pending.as_mut() {
+                    match key.code {
+                        KeyCode::Esc => {
+                            pending = None;
+                            status_msg = "Cancelled; nothing was changed.".to_string();
+                            is_error = false;
+                        }
+                        KeyCode::Backspace => {
+                            p.typed.pop();
+                        }
+                        KeyCode::Char(c) => p.typed.push(c),
+                        KeyCode::Enter => {
+                            let p = pending.take().unwrap();
+                            let res = if !p.plan.confirms(&p.typed) {
+                                Err(anyhow::anyhow!("Confirmation did not match '{}'; nothing was changed", p.plan.confirm_name))
+                            } else {
+                                match p.kind {
+                                    PendingKind::Target => mount_target(&sys, &p.plan, None),
+                                    PendingKind::Unblock => unblock_device(&sys, &p.plan),
+                                }
+                            };
+                            match res {
+                                Ok(msg) => { status_msg = msg; is_error = false; }
+                                Err(e) => { status_msg = format!("{:#}", e); is_error = true; }
+                            }
+                            devices = fetch_devices(&sys).unwrap_or_default();
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -404,70 +306,44 @@ fn run_tui() -> Result<()> {
                         table_state.select(Some(i));
                     }
                     KeyCode::Char('r') => {
-                        devices = fetch_devices().unwrap_or_default();
+                        devices = fetch_devices(&sys).unwrap_or_default();
                         status_msg = "Rescanned storage media.".to_string();
                         is_error = false;
                     }
-                    KeyCode::Char('e') => {
-                        if let Some(idx) = table_state.selected() {
-                            if let Some(fdev) = devices.get(idx) {
-                                let path = fdev.device.path.clone().unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
-                                if fdev.is_system {
-                                    status_msg = format!("ABORT: {} belongs to operating system!", path);
-                                    is_error = true;
-                                } else {
-                                    match mount_evidence(&path, None) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
-                                    }
-                                    devices = fetch_devices().unwrap_or_default();
-                                }
+                    KeyCode::Char(c @ ('e' | 't' | 'u')) => {
+                        let Some(selected) = table_state.selected().and_then(|i| devices.get(i)).cloned() else {
+                            continue;
+                        };
+                        let res = rescan_selected(&sys, &mut devices, &selected).and_then(|path| match c {
+                            'e' => {
+                                let msg = mount_evidence(&sys, &devices, &path, None);
+                                devices = fetch_devices(&sys).unwrap_or_default();
+                                msg.map(Some)
                             }
-                        }
-                    }
-                    KeyCode::Char('t') => {
-                        if let Some(idx) = table_state.selected() {
-                            if let Some(fdev) = devices.get(idx) {
-                                let path = fdev.device.path.clone().unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
-                                if fdev.is_system {
-                                    status_msg = format!("ABORT: {} belongs to operating system!", path);
-                                    is_error = true;
-                                } else {
-                                    match mount_target(&path, None) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
-                                    }
-                                    devices = fetch_devices().unwrap_or_default();
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('u') => {
-                        if let Some(idx) = table_state.selected() {
-                            if let Some(fdev) = devices.get(idx) {
-                                let path = fdev.device.path.clone().unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
-                                if fdev.is_system {
-                                    status_msg = format!("ABORT: {} belongs to operating system!", path);
-                                    is_error = true;
-                                } else {
-                                    match unblock_device(&path) {
-                                        Ok(msg) => { status_msg = msg; is_error = false; }
-                                        Err(e) => { status_msg = e.to_string(); is_error = true; }
-                                    }
-                                    devices = fetch_devices().unwrap_or_default();
-                                }
-                            }
+                            't' => plan_unblock(&sys, &devices, &path, UnblockMode::Target).map(|plan| {
+                                pending = Some(Pending { kind: PendingKind::Target, plan, typed: String::new() });
+                                None
+                            }),
+                            _ => plan_unblock(&sys, &devices, &path, UnblockMode::Raw).map(|plan| {
+                                pending = Some(Pending { kind: PendingKind::Unblock, plan, typed: String::new() });
+                                None
+                            }),
+                        });
+                        match res {
+                            Ok(Some(msg)) => { status_msg = msg; is_error = false; }
+                            Ok(None) => {}
+                            Err(e) => { status_msg = format!("{:#}", e); is_error = true; }
                         }
                     }
                     KeyCode::Char('x') => {
                         if let Some(idx) = table_state.selected() {
                             if let Some(fdev) = devices.get(idx) {
                                 let path = fdev.device.path.clone().unwrap_or_else(|| format!("/dev/{}", fdev.device.name));
-                                match unmount_device(&path) {
+                                match unmount_device(&sys, &path) {
                                     Ok(msg) => { status_msg = msg; is_error = false; }
                                     Err(e) => { status_msg = e.to_string(); is_error = true; }
                                 }
-                                devices = fetch_devices().unwrap_or_default();
+                                devices = fetch_devices(&sys).unwrap_or_default();
                             }
                         }
                     }
@@ -478,7 +354,7 @@ fn run_tui() -> Result<()> {
                         enable_raw_mode()?;
                         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
                         terminal.clear()?;
-                        devices = fetch_devices().unwrap_or_default();
+                        devices = fetch_devices(&sys).unwrap_or_default();
                     }
                     _ => {}
                 }
@@ -493,10 +369,11 @@ fn run_tui() -> Result<()> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let sys = RealSystem;
 
     match cli.command {
         Some(Commands::Status) => {
-            let devs = fetch_devices()?;
+            let devs = fetch_devices(&sys)?;
             println!("{:<14} {:<8} {:<12} {:<8} {:<24} MODEL / SERIAL", "DEVICE", "SIZE", "STATUS", "FS", "MOUNTPOINT");
             println!("{}", "-".repeat(80));
             for fdev in devs {
@@ -507,24 +384,31 @@ fn main() -> Result<()> {
                 let fstype = dev.fstype.as_deref().unwrap_or("-");
                 let ro = dev.ro.unwrap_or(false);
                 let status = if fdev.is_system { "[SYSTEM]" } else if ro { "RO-LOCKED" } else { "RW-TARGET" };
-                let mount = dev.mountpoints.as_ref().and_then(|ms| ms.iter().flatten().next().map(|s| s.as_str())).unwrap_or("-");
+                let mount = dev.mounts().next().unwrap_or("-");
                 println!("{:<14} {:<8} {:<12} {:<8} {:<24}", name, size, status, fstype, mount);
             }
         }
         Some(Commands::Evidence { device, target }) => {
-            let res = mount_evidence(&device, target.as_deref())?;
+            let devs = fetch_devices(&sys)?;
+            let res = mount_evidence(&sys, &devs, &device, target.as_deref())?;
             println!("[✓] {}", res);
         }
-        Some(Commands::Target { device, target }) => {
-            let res = mount_target(&device, target.as_deref())?;
+        Some(Commands::Target { device, target, confirm }) => {
+            let devs = fetch_devices(&sys)?;
+            let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Target)?;
+            confirm_cli(&plan, confirm.as_deref())?;
+            let res = mount_target(&sys, &plan, target.as_deref())?;
             println!("[✓] {}", res);
         }
-        Some(Commands::Unblock { device }) => {
-            let res = unblock_device(&device)?;
+        Some(Commands::Unblock { device, confirm }) => {
+            let devs = fetch_devices(&sys)?;
+            let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Raw)?;
+            confirm_cli(&plan, confirm.as_deref())?;
+            let res = unblock_device(&sys, &plan)?;
             println!("[✓] {}", res);
         }
         Some(Commands::Umount { target }) => {
-            let res = unmount_device(&target)?;
+            let res = unmount_device(&sys, &target)?;
             println!("[✓] {}", res);
         }
         None => {

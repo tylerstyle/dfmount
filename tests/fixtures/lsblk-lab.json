@@ -1,0 +1,37 @@
+{
+   "blockdevices": [
+      {"name":"nvme0n1", "path":"/dev/nvme0n1", "size":"931.5G", "ro":false, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"Samsung SSD 990", "serial":"S6Z0NJ0W", "children": [
+         {"name":"nvme0n1p1", "path":"/dev/nvme0n1p1", "size":"512M", "ro":false, "type":"part", "fstype":"vfat", "label":"ESP", "mountpoints":["/boot"], "model":null, "serial":null},
+         {"name":"nvme0n1p2", "path":"/dev/nvme0n1p2", "size":"931G", "ro":false, "type":"part", "fstype":"ext4", "label":"nixos", "mountpoints":["/nix/store", "/"], "model":null, "serial":null}
+      ]},
+      {"name":"sr0", "path":"/dev/sr0", "size":"3.9G", "ro":true, "type":"rom", "fstype":"iso9660", "label":"DFNIX_LIVE", "mountpoints":[null], "model":"Virtual ODD", "serial":"ZM001"},
+      {"name":"sdb", "path":"/dev/sdb", "size":"465.8G", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"WDC WD5000", "serial":"WD-EVID001", "children": [
+         {"name":"sdb1", "path":"/dev/sdb1", "size":"400G", "ro":true, "type":"part", "fstype":"ntfs", "label":"Windows", "mountpoints":["/media/evidence/sdb1"], "model":null, "serial":null},
+         {"name":"sdb2", "path":"/dev/sdb2", "size":"65.8G", "ro":true, "type":"part", "fstype":"ext4", "label":null, "mountpoints":[null], "model":null, "serial":null}
+      ]},
+      {"name":"sdc", "path":"/dev/sdc", "size":"3.6T", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"Expansion HDD", "serial":"NAA7TGT1", "children": [
+         {"name":"sdc1", "path":"/dev/sdc1", "size":"3T", "ro":true, "type":"part", "fstype":"exfat", "label":"TARGET", "mountpoints":[null], "model":null, "serial":null},
+         {"name":"sdc2", "path":"/dev/sdc2", "size":"600G", "ro":true, "type":"part", "fstype":"crypto_LUKS", "label":null, "mountpoints":[null], "model":null, "serial":null, "children": [
+            {"name":"luks-tgt", "path":"/dev/mapper/luks-tgt", "size":"600G", "ro":false, "type":"crypt", "fstype":"ext4", "label":null, "mountpoints":[null], "model":null, "serial":null}
+         ]}
+      ]},
+      {"name":"sdd", "path":"/dev/sdd", "size":"1.8T", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"Blank Clone Disk", "serial":"BLANK0001"},
+      {"name":"sde", "path":"/dev/sde", "size":"58.6G", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"USB Stick", "serial":"USB0001", "children": [
+         {"name":"sde1", "path":"/dev/sde1", "size":"58.6G", "ro":true, "type":"part", "fstype":"vfat", "label":"STICK", "mountpoints":["/run/media/nixos/STICK"], "model":null, "serial":null}
+      ]},
+      {"name":"sdf", "path":"/dev/sdf", "size":"1T", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"RAID Member A", "serial":"RAIDA", "children": [
+         {"name":"sdf1", "path":"/dev/sdf1", "size":"1T", "ro":true, "type":"part", "fstype":"linux_raid_member", "label":null, "mountpoints":[null], "model":null, "serial":null, "children": [
+            {"name":"md0", "path":"/dev/md0", "size":"1T", "ro":false, "type":"raid1", "fstype":"ext4", "label":null, "mountpoints":[null], "model":null, "serial":null}
+         ]}
+      ]},
+      {"name":"sdg", "path":"/dev/sdg", "size":"1T", "ro":true, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"RAID Member B", "serial":"RAIDB", "children": [
+         {"name":"sdg1", "path":"/dev/sdg1", "size":"1T", "ro":true, "type":"part", "fstype":"linux_raid_member", "label":null, "mountpoints":[null], "model":null, "serial":null, "children": [
+            {"name":"md0", "path":"/dev/md0", "size":"1T", "ro":false, "type":"raid1", "fstype":"ext4", "label":null, "mountpoints":[null], "model":null, "serial":null}
+         ]}
+      ]},
+      {"name":"sdh", "path":"/dev/sdh", "size":"2T", "ro":false, "type":"disk", "fstype":null, "label":null, "mountpoints":[null], "model":"Target SSD", "serial":"TGT0002", "children": [
+         {"name":"sdh1", "path":"/dev/sdh1", "size":"1T", "ro":false, "type":"part", "fstype":"ext4", "label":"IMAGES", "mountpoints":["/media/target/sdh1"], "model":null, "serial":null},
+         {"name":"sdh2", "path":"/dev/sdh2", "size":"1T", "ro":true, "type":"part", "fstype":"ext4", "label":null, "mountpoints":[null], "model":null, "serial":null}
+      ]}
+   ]
+}

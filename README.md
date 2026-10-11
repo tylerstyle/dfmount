@@ -14,7 +14,9 @@
   - Mounts ext3/ext4 with `noload` to prevent kernel superblock / journal alteration.
   - Mounts XFS with `norecovery`.
   - Mounts Btrfs with `rescue=nologreplay`.
-  - Mounts NTFS with `norecover`.
+  - Mounts NTFS read-only via `ntfs3`, falling back to `ntfs-3g` (also read-only).
+  - Locks the device with `blockdev --setro` and verifies the flag before mounting; aborts if that fails.
+  - Probes with `blkid -p` and refuses ambiguous, unrecognised, encrypted or unsupported signatures instead of attempting a generic mount.
 - **System Drive Guardrails**:
   - Automatically detects `/`, `/boot`, `/nix`, and active swap partitions to prevent accidental unmounting or modification.
 - **Direct `dfdisk` Integration**:
@@ -44,11 +46,14 @@ sudo dfmount status
 # Mount evidence partition read-only
 sudo dfmount evidence /dev/sdb1
 
-# Mount destination target drive writeable
+# Mount destination target drive writeable (prompts you to type "sdc1")
 sudo dfmount target /dev/sdc1
 
-# Unblock raw disk for cloning target
+# Unblock raw disk for cloning target (prompts you to type "sdc")
 sudo dfmount unblock /dev/sdc
+
+# Non-interactive use must name the device explicitly
+sudo dfmount unblock /dev/sdc --confirm sdc
 
 # Safely unmount
 sudo dfmount umount /media/evidence/sdb1
