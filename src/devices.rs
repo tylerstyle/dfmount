@@ -50,7 +50,10 @@ pub fn resolve_non_system<'a>(
     // or have re-enumerated under another name
     if let Some(registry) = sys.protected_registry()? {
         for h in &hits {
-            if let Some(p) = registry.protecting(flat, &h.device.dev_path()) {
+            // Match by the device number lsblk reported for this entry rather than by
+            // stat()ing the node, so the check never depends on the host's /dev
+            let dev = h.device.dev_num();
+            if let Some(p) = registry.protecting_dev(flat, &h.device.dev_path(), dev) {
                 bail!(
                     "ABORT: {} is protected by the dfnix registry ({:?} {}): {}",
                     h.device.dev_path(),
