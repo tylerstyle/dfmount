@@ -4,6 +4,9 @@
 , makeWrapper
 , util-linux
 , coreutils
+, cryptsetup
+, mdadm
+, lvm2
   # dfcore is a sibling path dependency (../dfcore); flakes pass their input
 , dfcoreSrc ? ../dfcore
 }:
@@ -45,7 +48,8 @@ rustPlatform.buildRustPackage {
     ln -s $out/bin/dfmount $out/bin/df-umount
 
     wrapProgram $out/bin/dfmount \
-      --prefix PATH : ${lib.makeBinPath [ util-linux coreutils ]}
+      --prefix PATH : ${lib.makeBinPath [ util-linux coreutils cryptsetup mdadm lvm2 ]}
+    # zpool/zfs come from the system: they must match its kernel module
 
     # Desktop launcher entry
     mkdir -p $out/share/applications

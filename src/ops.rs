@@ -467,3 +467,171 @@ fn unmount_steps(sys: &dyn System, target: &str) -> Result<String> {
         bail!("Failed to unmount {}: {}", target, out.stderr.trim())
     }
 }
+
+/// Encryption formats cryptsetup opens read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CryptKind {
+    /// LUKS or BitLocker, from the on-disk signature
+    Auto,
+    Luks,
+    /// BitLocker (key: password or 48-digit recovery password)
+    Bitlk,
+    /// VeraCrypt (no on-disk signature; must be named)
+    Veracrypt,
+    /// TrueCrypt (no on-disk signature; must be named)
+    Truecrypt,
+    /// FileVault 2 on Core Storage (macOS 10.7–10.12); not APFS
+    Fvault2,
+}
+
+fn blkid_type(sys: &dyn System, dev: &str) -> Result<Option<String>> {
+    let probe = sys
+        .run("blkid", &["-p", "-o", "export", dev])
+        .context("Failed to run blkid")?;
+    Ok(probe
+        .stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("TYPE="))
+        .map(str::to_string))
+}
+
+/// Open an encrypted evidence volume read-only with cryptsetup. The backing
+/// device is locked read-only first; the passphrase goes from the terminal to
+/// cryptsetup (or comes from `key_file`) and is never seen or logged by
+/// dfmount; the mapping must be read-only, or it is closed again.
+pub fn unlock(
+    sys: &dyn System,
+    flat: &[FlatDevice],
+    device: &str,
+    kind: CryptKind,
+    name: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<String> {
+    let mut details = Map::new();
+    let result = unlock_steps(sys, flat, device, kind, name, key_file, &mut details);
+    let refusal = !details.contains_key("open_attempted");
+    audit(
+        sys,
+        "volume_unlock",
+        flat,
+        device,
+        details,
+        &result,
+        refusal,
+    );
+    result
+}
+
+fn unlock_steps(
+    sys: &dyn System,
+    flat: &[FlatDevice],
+    device: &str,
+    kind: CryptKind,
+    name: Option<&str>,
+    key_file: Option<&str>,
+    details: &mut Map<String, Value>,
+) -> Result<String> {
+    let hits = resolve_non_system(sys, flat, device)?;
+    let dev = hits[0].device.dev_path();
+    set_ro_verified(sys, &dev)?;
+    details.insert("ro_verified".into(), true.into());
+
+    let (ctype, extra): (&str, &[&str]) = match kind {
+        CryptKind::Luks => ("luks", &[]),
+        CryptKind::Bitlk => ("bitlk", &[]),
+        CryptKind::Veracrypt => ("tcrypt", &["--veracrypt"]),
+        CryptKind::Truecrypt => ("tcrypt", &[]),
+        CryptKind::Fvault2 => ("fvault2", &[]),
+        CryptKind::Auto => match blkid_type(sys, &dev)?.as_deref() {
+            Some("crypto_LUKS") => ("luks", &[]),
+            Some("BitLocker") => ("bitlk", &[]),
+            Some("apfs") => bail!(
+                "{dev}: APFS (FileVault on APFS) cannot be opened by cryptsetup; mount it read-only with apfs-fuse and the volume password"
+            ),
+            other => bail!(
+                "{dev}: no LUKS or BitLocker signature ({}). VeraCrypt and TrueCrypt volumes have none: pass --type veracrypt or --type truecrypt; FileVault 2 on Core Storage: --type fvault2",
+                other.unwrap_or("none")
+            ),
+        },
+    };
+    details.insert("type".into(), ctype.into());
+    if !extra.is_empty() {
+        details.insert("type_options".into(), extra.join(" ").into());
+    }
+
+    let name = name
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("ev_{}", dev_basename(&dev, "volume")));
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        bail!("mapping name {name:?}: use letters, digits, '_', '-' and '.'");
+    }
+    if sys.run("dmsetup", &["info", &name])?.success() {
+        bail!("/dev/mapper/{name} already exists; choose another --name or close it first");
+    }
+    let mapper = format!("/dev/mapper/{name}");
+    details.insert("mapping".into(), mapper.clone().into());
+    details.insert(
+        "key_source".into(),
+        if key_file.is_some() {
+            "key file"
+        } else {
+            "typed at the terminal"
+        }
+        .into(),
+    );
+
+    let mut args = vec!["open", "--readonly", "--type", ctype];
+    args.extend_from_slice(extra);
+    if let Some(k) = key_file {
+        args.extend_from_slice(&["--key-file", k]);
+    }
+    args.extend_from_slice(&[&dev, &name]);
+    details.insert("open_attempted".into(), true.into());
+    let code = sys
+        .run_interactive("cryptsetup", &args)
+        .context("Failed to run cryptsetup")?;
+    if code != Some(0) {
+        bail!(
+            "cryptsetup could not open {dev} as {ctype} (exit {}): wrong passphrase or key, or not a {ctype} volume",
+            code.map_or("signal".to_string(), |c| c.to_string())
+        );
+    }
+    if !matches!(blockdev_getro(sys, &mapper), Ok(true)) {
+        let _ = sys.run("cryptsetup", &["close", &name]);
+        bail!("{mapper} was not read-only; it has been closed again");
+    }
+    details.insert("mapping_ro_verified".into(), true.into());
+    Ok(format!(
+        "Opened {dev} read-only as {mapper} ({ctype}). Mount it with: dfmount evidence {mapper}"
+    ))
+}
+
+/// Close a mapping opened by [`unlock`] (`ev_sdb2` or `/dev/mapper/ev_sdb2`).
+pub fn lock(sys: &dyn System, flat: &[FlatDevice], name: &str) -> Result<String> {
+    let name = name.strip_prefix("/dev/mapper/").unwrap_or(name);
+    let mapper = format!("/dev/mapper/{name}");
+    let result = (|| -> Result<String> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            bail!("mapping name {name:?}: use letters, digits, '_', '-' and '.'");
+        }
+        let out = sys
+            .run("cryptsetup", &["close", name])
+            .context("Failed to run cryptsetup")?;
+        if !out.success() {
+            bail!("cryptsetup close {name} failed: {}", out.stderr.trim());
+        }
+        Ok(format!("Closed {mapper}"))
+    })();
+    let mut details = Map::new();
+    details.insert("mapping".into(), mapper.clone().into());
+    audit(sys, "volume_lock", flat, &mapper, details, &result, false);
+    result
+}

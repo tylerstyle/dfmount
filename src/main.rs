@@ -6,10 +6,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dfmount::{
+    assemble::{assemble, disassemble, Kind as AssembleKind},
     devices::{fetch_devices, FlatDevice},
     ops::{
-        mount_evidence, mount_target, plan_unblock, record_unconfirmed, unblock_device,
-        unmount_device, UnblockMode, UnblockPlan,
+        lock, mount_evidence, mount_target, plan_unblock, record_unconfirmed, unblock_device,
+        unlock, unmount_device, CryptKind, UnblockMode, UnblockPlan,
     },
     sys::{RealSystem, System},
 };
@@ -64,6 +65,35 @@ enum Commands {
     },
     /// Safely flush and unmount partition
     Umount { target: String },
+    /// Open an encrypted evidence volume read-only (LUKS, BitLocker, VeraCrypt,
+    /// TrueCrypt, FileVault 2) with cryptsetup
+    Unlock {
+        device: String,
+        #[arg(long = "type", value_enum, default_value = "auto")]
+        kind: CryptKind,
+        /// Name under /dev/mapper (default: ev_<device>)
+        #[arg(long)]
+        name: Option<String>,
+        /// Read the key from this file instead of asking at the terminal
+        #[arg(long)]
+        key_file: Option<String>,
+    },
+    /// Close a volume opened with unlock
+    Lock { name: String },
+    /// Reassemble md RAID, LVM or ZFS read-only from member images (or disks)
+    /// through read-only loop devices
+    Assemble {
+        #[arg(long, value_enum)]
+        kind: AssembleKind,
+        /// Member images or devices, in any order
+        #[arg(required = true)]
+        members: Vec<String>,
+        /// Name for disassemble (default: md device, volume group or pool)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Take apart an assembly and detach its loop devices
+    Disassemble { name: String },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -635,6 +665,41 @@ fn main() -> Result<()> {
             let plan = plan_unblock(&sys, &devs, &device, UnblockMode::Raw)?;
             confirm_cli(&sys, &devs, &plan, confirm.as_deref())?;
             let res = unblock_device(&sys, &devs, &plan)?;
+            println!("[✓] {}", res);
+        }
+        Some(Commands::Unlock {
+            device,
+            kind,
+            name,
+            key_file,
+        }) => {
+            let devs = fetch_devices(&sys)?;
+            let res = unlock(
+                &sys,
+                &devs,
+                &device,
+                kind,
+                name.as_deref(),
+                key_file.as_deref(),
+            )?;
+            println!("[✓] {}", res);
+        }
+        Some(Commands::Lock { name }) => {
+            let devs = fetch_devices(&sys)?;
+            let res = lock(&sys, &devs, &name)?;
+            println!("[✓] {}", res);
+        }
+        Some(Commands::Assemble {
+            kind,
+            members,
+            name,
+        }) => {
+            let devs = fetch_devices(&sys)?;
+            let res = assemble(&sys, &devs, kind, &members, name.as_deref())?;
+            println!("[✓] {}", res);
+        }
+        Some(Commands::Disassemble { name }) => {
+            let res = disassemble(&sys, &name)?;
             println!("[✓] {}", res);
         }
         Some(Commands::Umount { target }) => {

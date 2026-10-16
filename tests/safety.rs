@@ -12,10 +12,11 @@ use dfcore::{
     protected::Registry,
 };
 use dfmount::{
+    assemble::{assemble, disassemble, Kind},
     devices::{is_mount_system, parse_lsblk, FlatDevice},
     ops::{
-        apply_unblock, mount_evidence, mount_target, plan_unblock, record_unconfirmed,
-        unblock_device, unmount_device, UnblockMode,
+        apply_unblock, lock, mount_evidence, mount_target, plan_unblock, record_unconfirmed,
+        unblock_device, unlock, unmount_device, CryptKind, UnblockMode,
     },
     sys::{CmdOutput, System},
 };
@@ -38,6 +39,10 @@ struct FakeHost {
     calls: RefCell<Vec<String>>,
     registry: Option<Registry>,
     events: RefCell<Vec<Event>>,
+    /// Exit code of interactive commands (cryptsetup with a prompt); None = 0
+    interactive_exit: Option<i32>,
+    /// Files and paths that exist on the simulated host
+    files: RefCell<HashMap<String, String>>,
 }
 
 impl FakeHost {
@@ -59,6 +64,24 @@ impl FakeHost {
 
     fn fail(mut self, cmd: &str) -> Self {
         self.failing.insert(cmd.to_string());
+        self
+    }
+
+    fn file(self, path: &str, content: &str) -> Self {
+        self.files
+            .borrow_mut()
+            .insert(path.to_string(), content.to_string());
+        self
+    }
+
+    fn interactive_exit(mut self, code: i32) -> Self {
+        self.interactive_exit = Some(code);
+        self
+    }
+
+    /// A device whose kernel read-only flag reads 0
+    fn writable(self, dev: &str) -> Self {
+        self.ro.borrow_mut().insert(dev.to_string(), false);
         self
     }
 
@@ -131,6 +154,15 @@ impl System for FakeHost {
         })
     }
 
+    fn run_interactive(&self, program: &str, args: &[&str]) -> io::Result<Option<i32>> {
+        let line = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.calls.borrow_mut().push(format!("tty {line}"));
+        Ok(Some(self.interactive_exit.unwrap_or(0)))
+    }
+
     fn canonicalize(&self, path: &str) -> String {
         self.aliases
             .get(path)
@@ -140,6 +172,33 @@ impl System for FakeHost {
 
     fn create_dir_all(&self, _path: &str) -> io::Result<()> {
         Ok(())
+    }
+
+    fn read_file(&self, path: &str) -> io::Result<String> {
+        self.files
+            .borrow()
+            .get(path)
+            .cloned()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn write_file(&self, path: &str, content: &str) -> io::Result<()> {
+        self.files
+            .borrow_mut()
+            .insert(path.to_string(), content.to_string());
+        Ok(())
+    }
+
+    fn remove_file(&self, path: &str) -> io::Result<()> {
+        self.files
+            .borrow_mut()
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+    }
+
+    fn exists(&self, path: &str) -> bool {
+        self.files.borrow().contains_key(path)
     }
 
     fn protected_registry(&self) -> anyhow::Result<Option<Registry>> {
@@ -652,4 +711,451 @@ fn every_action_is_audited_with_its_outcome() {
         serde_json::json!(["/dev/sdc", "/dev/sdc1"])
     );
     assert_eq!(events[3].details["mountpoint"], "/media/target/sdc1");
+}
+
+// ---------------------------------------------------------------------------
+// Read-only unlock of encrypted evidence volumes
+// ---------------------------------------------------------------------------
+
+fn crypt_host(blkid_type: &str) -> FakeHost {
+    FakeHost::new()
+        .respond(
+            "blkid -p -o export /dev/sdb2",
+            0,
+            &format!("DEVNAME=/dev/sdb2\nTYPE={blkid_type}\n"),
+        )
+        // No mapping of that name yet
+        .respond("dmsetup info ev_sdb2", 1, "")
+}
+
+#[test]
+fn unlock_opens_read_only_after_locking_the_device() {
+    let flat = lab();
+    let host = crypt_host("crypto_LUKS");
+    let msg = unlock(&host, &flat, "/dev/sdb2", CryptKind::Auto, None, None).unwrap();
+    assert!(msg.contains("/dev/mapper/ev_sdb2"), "{msg}");
+    let calls = host.calls();
+    let setro = calls
+        .iter()
+        .position(|c| c == "blockdev --setro /dev/sdb2")
+        .unwrap();
+    let open = calls
+        .iter()
+        .position(|c| c == "tty cryptsetup open --readonly --type luks /dev/sdb2 ev_sdb2")
+        .unwrap();
+    assert!(setro < open, "{calls:?}");
+    assert!(calls.contains(&"blockdev --getro /dev/mapper/ev_sdb2".to_string()));
+    assert_eq!(host.events(), [("volume_unlock".to_string(), Outcome::Ok)]);
+    let details = &host.events.borrow()[0].details;
+    assert_eq!(details["key_source"], "typed at the terminal");
+}
+
+#[test]
+fn unlock_bitlocker_and_named_formats() {
+    let flat = lab();
+    let host = crypt_host("BitLocker");
+    unlock(&host, &flat, "/dev/sdb2", CryptKind::Auto, None, None).unwrap();
+    assert!(host
+        .calls()
+        .contains(&"tty cryptsetup open --readonly --type bitlk /dev/sdb2 ev_sdb2".to_string()));
+
+    let host = crypt_host("");
+    unlock(
+        &host,
+        &flat,
+        "/dev/sdb2",
+        CryptKind::Veracrypt,
+        Some("vc1"),
+        Some("/root/key"),
+    )
+    .unwrap_err();
+    // vc1 "exists": the fake answers every unknown command with success
+    let host = crypt_host("").respond("dmsetup info vc1", 1, "");
+    unlock(
+        &host,
+        &flat,
+        "/dev/sdb2",
+        CryptKind::Veracrypt,
+        Some("vc1"),
+        Some("/root/key"),
+    )
+    .unwrap();
+    assert!(host.calls().contains(
+        &"tty cryptsetup open --readonly --type tcrypt --veracrypt --key-file /root/key /dev/sdb2 vc1"
+            .to_string()
+    ));
+}
+
+#[test]
+fn unlock_refuses_what_it_cannot_open_safely() {
+    let flat = lab();
+    // System disk: refused before anything runs
+    let host = crypt_host("crypto_LUKS");
+    let err = err_of(unlock(
+        &host,
+        &flat,
+        "/dev/nvme0n1p2",
+        CryptKind::Auto,
+        None,
+        None,
+    ));
+    assert!(err.contains("operating system"), "{err}");
+    assert!(!host.calls().iter().any(|c| c.contains("cryptsetup")));
+    assert_eq!(
+        host.events(),
+        [("volume_unlock".to_string(), Outcome::Refused)]
+    );
+
+    // No signature, and APFS
+    for (ty, hint) in [("ext4", "--type veracrypt"), ("apfs", "apfs-fuse")] {
+        let host = crypt_host(ty);
+        let err = err_of(unlock(
+            &host,
+            &flat,
+            "/dev/sdb2",
+            CryptKind::Auto,
+            None,
+            None,
+        ));
+        assert!(err.contains(hint), "{err}");
+        assert!(!host.calls().iter().any(|c| c.contains("cryptsetup")));
+    }
+
+    // A name that is not a plain mapper name
+    let host = crypt_host("crypto_LUKS");
+    let err = err_of(unlock(
+        &host,
+        &flat,
+        "/dev/sdb2",
+        CryptKind::Auto,
+        Some("../x"),
+        None,
+    ));
+    assert!(err.contains("mapping name"), "{err}");
+}
+
+#[test]
+fn unlock_failures_are_errors_and_a_writable_mapping_is_closed() {
+    let flat = lab();
+    let host = crypt_host("crypto_LUKS").interactive_exit(2);
+    let err = err_of(unlock(
+        &host,
+        &flat,
+        "/dev/sdb2",
+        CryptKind::Auto,
+        None,
+        None,
+    ));
+    assert!(err.contains("wrong passphrase"), "{err}");
+    assert_eq!(
+        host.events(),
+        [("volume_unlock".to_string(), Outcome::Error)]
+    );
+
+    let host = crypt_host("crypto_LUKS").writable("/dev/mapper/ev_sdb2");
+    let err = err_of(unlock(
+        &host,
+        &flat,
+        "/dev/sdb2",
+        CryptKind::Auto,
+        None,
+        None,
+    ));
+    assert!(err.contains("not read-only"), "{err}");
+    assert!(host
+        .calls()
+        .contains(&"cryptsetup close ev_sdb2".to_string()));
+
+    let host = FakeHost::new();
+    lock(&host, &flat, "ev_sdb2").unwrap();
+    assert!(host
+        .calls()
+        .contains(&"cryptsetup close ev_sdb2".to_string()));
+    assert_eq!(host.events(), [("volume_lock".to_string(), Outcome::Ok)]);
+}
+
+// ---------------------------------------------------------------------------
+// Read-only reassembly from member images
+// ---------------------------------------------------------------------------
+
+fn images(host: FakeHost, names: &[&str]) -> FakeHost {
+    let mut host = host;
+    for (i, n) in names.iter().enumerate() {
+        host = host
+            .file(&format!("/cases/{n}"), "")
+            .respond(
+                &format!("losetup -r -f --show /cases/{n}"),
+                0,
+                &format!("/dev/loop{i}\n"),
+            )
+            .respond(
+                &format!("losetup -r -f --show -P /cases/{n}"),
+                0,
+                &format!("/dev/loop{i}\n"),
+            );
+    }
+    host
+}
+
+fn members(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| format!("/cases/{n}")).collect()
+}
+
+#[test]
+fn md_is_assembled_read_only_from_read_only_loops_and_taken_apart() {
+    let flat = lab();
+    // /sys/block/md100 itself is absent, so md100 is free; its array_state is
+    // what the kernel shows once the array runs
+    let host = images(FakeHost::new(), &["a.raw", "b.raw"])
+        .file("/sys/block/md100/md/array_state", "readonly\n");
+    let msg = assemble(&host, &flat, Kind::Md, &members(&["a.raw", "b.raw"]), None).unwrap();
+    assert!(msg.contains("/dev/md100"), "{msg}");
+    let calls = host.calls();
+    assert!(
+        calls.contains(&"mdadm --assemble --readonly /dev/md100 /dev/loop0 /dev/loop1".to_string()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"blockdev --getro /dev/loop1".to_string()));
+    let state: serde_json::Value =
+        serde_json::from_str(&host.read_file("/run/dfnix/assembled/md100.json").unwrap()).unwrap();
+    assert_eq!(
+        state["loops"],
+        serde_json::json!(["/dev/loop0", "/dev/loop1"])
+    );
+    assert_eq!(host.events(), [("raid_assemble".to_string(), Outcome::Ok)]);
+
+    disassemble(&host, "md100").unwrap();
+    let calls = host.calls();
+    assert!(calls.contains(&"mdadm --stop /dev/md100".to_string()));
+    assert!(calls.contains(&"losetup -d /dev/loop0".to_string()));
+    assert!(!host.exists("/run/dfnix/assembled/md100.json"));
+}
+
+#[test]
+fn an_array_that_is_not_read_only_is_stopped_and_detached() {
+    let flat = lab();
+    let host = images(FakeHost::new(), &["a.raw"]);
+    // md100 exists already: md101 is used
+    let host = host
+        .file("/sys/block/md100", "")
+        .file("/sys/block/md101/md/array_state", "clean\n");
+    let err = err_of(assemble(&host, &flat, Kind::Md, &members(&["a.raw"]), None));
+    assert!(err.contains("not readonly"), "{err}");
+    let calls = host.calls();
+    assert!(
+        calls.contains(&"mdadm --stop /dev/md101".to_string()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"losetup -d /dev/loop0".to_string()));
+    assert_eq!(
+        host.events(),
+        [("raid_assemble".to_string(), Outcome::Error)]
+    );
+}
+
+#[test]
+fn system_disks_and_missing_images_are_refused_before_any_loop() {
+    let flat = lab();
+    let host = FakeHost::new();
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Md,
+        &["/dev/nvme0n1".into()],
+        None,
+    ));
+    assert!(err.contains("operating system"), "{err}");
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Md,
+        &members(&["missing.raw"]),
+        None,
+    ));
+    assert!(err.contains("no such image"), "{err}");
+    assert!(!host.calls().iter().any(|c| c.starts_with("losetup")));
+    assert_eq!(
+        host.events(),
+        [
+            ("raid_assemble".to_string(), Outcome::Refused),
+            ("raid_assemble".to_string(), Outcome::Refused)
+        ]
+    );
+    // A member disk is locked read-only before it is looped
+    let host = FakeHost::new().respond("losetup -r -f --show /dev/sdd", 0, "/dev/loop0\n");
+    let _ = assemble(&host, &flat, Kind::Md, &["/dev/sdd".into()], None);
+    let calls = host.calls();
+    let setro = calls
+        .iter()
+        .position(|c| c == "blockdev --setro /dev/sdd")
+        .unwrap();
+    let lo = calls
+        .iter()
+        .position(|c| c == "losetup -r -f --show /dev/sdd")
+        .unwrap();
+    assert!(setro < lo, "{calls:?}");
+}
+
+#[test]
+fn lvm_activates_read_only_through_the_loops_only() {
+    let flat = lab();
+    let config =
+        "global { metadata_read_only = 1 } activation { read_only_volume_list = [ \"evvg\" ] }";
+    let host = images(FakeHost::new(), &["pv.raw"])
+        .respond(
+            "pvs --devices /dev/loop0 --noheadings -o vg_name",
+            0,
+            "  evvg\n",
+        )
+        .respond(
+            "lvs --devices /dev/loop0 --noheadings -o lv_path evvg",
+            0,
+            "  /dev/evvg/evlv\n",
+        );
+    assemble(
+        &host,
+        &flat,
+        Kind::Lvm,
+        &members(&["pv.raw"]),
+        Some("case1"),
+    )
+    .unwrap();
+    assert!(host.calls().contains(&format!(
+        "vgchange -ay --devices /dev/loop0 --config {config} evvg"
+    )));
+    disassemble(&host, "case1").unwrap();
+    assert!(host.calls().contains(&format!(
+        "vgchange -an --devices /dev/loop0 --config {config} evvg"
+    )));
+
+    // A writable logical volume is deactivated again
+    let host = images(FakeHost::new(), &["pv.raw"])
+        .respond(
+            "pvs --devices /dev/loop0 --noheadings -o vg_name",
+            0,
+            "  evvg\n",
+        )
+        .respond(
+            "lvs --devices /dev/loop0 --noheadings -o lv_path evvg",
+            0,
+            "  /dev/evvg/evlv\n",
+        )
+        .writable("/dev/evvg/evlv");
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Lvm,
+        &members(&["pv.raw"]),
+        None,
+    ));
+    assert!(err.contains("not read-only"), "{err}");
+    assert!(host.calls().contains(&format!(
+        "vgchange -an --devices /dev/loop0 --config {config} evvg"
+    )));
+
+    // Members of two volume groups
+    let host = images(FakeHost::new(), &["a.raw", "b.raw"]).respond(
+        "pvs --devices /dev/loop0,/dev/loop1 --noheadings -o vg_name",
+        0,
+        "  vg1\n  vg2\n",
+    );
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Lvm,
+        &members(&["a.raw", "b.raw"]),
+        None,
+    ));
+    assert!(err.contains("2 volume groups"), "{err}");
+}
+
+#[test]
+fn zfs_imports_read_only_from_partitioned_loops() {
+    let flat = lab();
+    let host = images(FakeHost::new(), &["z.raw"])
+        .file("/dev/loop0p1", "")
+        .respond(
+            "zpool import -d /dev/loop0 -d /dev/loop0p1",
+            0,
+            "   pool: evpool\n     id: 42\n  state: ONLINE\n",
+        )
+        .respond("zpool get -H -o value readonly evpool", 0, "on\n");
+    let msg = assemble(&host, &flat, Kind::Zfs, &members(&["z.raw"]), None).unwrap();
+    assert!(msg.contains("/media/evidence/zfs_evpool"), "{msg}");
+    let calls = host.calls();
+    assert!(calls.contains(&"losetup -r -f --show -P /cases/z.raw".to_string()));
+    assert!(calls.contains(
+        &"zpool import -o readonly=on -o cachefile=none -N -R /media/evidence/zfs_evpool -f -d /dev/loop0 -d /dev/loop0p1 evpool"
+            .to_string()
+    ), "{calls:?}");
+    disassemble(&host, "evpool").unwrap();
+    assert!(host.calls().contains(&"zpool export evpool".to_string()));
+
+    // Imported but not read-only: exported again
+    let host = images(FakeHost::new(), &["z.raw"])
+        .respond("zpool import -d /dev/loop0", 0, "   pool: evpool\n")
+        .respond("zpool get -H -o value readonly evpool", 0, "off\n");
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Zfs,
+        &members(&["z.raw"]),
+        None,
+    ));
+    assert!(err.contains("not imported read-only"), "{err}");
+    assert!(host.calls().contains(&"zpool export evpool".to_string()));
+}
+
+#[test]
+fn review_fixes_teardown_symlinks_and_mapper_names() {
+    let flat = lab();
+    // A symlink to the system disk is a device, refused before any loop
+    let host = FakeHost::new().alias("/cases/disk.raw", "/dev/nvme0n1");
+    let err = err_of(assemble(
+        &host,
+        &flat,
+        Kind::Md,
+        &members(&["disk.raw"]),
+        None,
+    ));
+    assert!(err.contains("operating system"), "{err}");
+    assert!(!host.calls().iter().any(|c| c.starts_with("losetup")));
+
+    // lvs fails after activation: the volume group is deactivated again
+    let host = images(FakeHost::new(), &["pv.raw"])
+        .respond(
+            "pvs --devices /dev/loop0 --noheadings -o vg_name",
+            0,
+            "  evvg\n",
+        )
+        .fail("lvs --devices /dev/loop0 --noheadings -o lv_path evvg");
+    assemble(&host, &flat, Kind::Lvm, &members(&["pv.raw"]), None).unwrap_err();
+    assert!(host.calls().iter().any(|c| c.starts_with("vgchange -an")));
+    assert!(host.calls().contains(&"losetup -d /dev/loop0".to_string()));
+
+    // zpool get fails after the import: exported again
+    let host = images(FakeHost::new(), &["z.raw"])
+        .respond("zpool import -d /dev/loop0", 0, "   pool: evpool\n")
+        .fail("zpool get -H -o value readonly evpool");
+    assemble(&host, &flat, Kind::Zfs, &members(&["z.raw"]), None).unwrap_err();
+    assert!(host.calls().contains(&"zpool export evpool".to_string()));
+
+    // The default name is taken: the array is stopped again
+    let host = images(FakeHost::new(), &["a.raw"])
+        .file("/sys/block/md100/md/array_state", "readonly\n")
+        .file("/run/dfnix/assembled/md100.json", "{}");
+    let err = err_of(assemble(&host, &flat, Kind::Md, &members(&["a.raw"]), None));
+    assert!(err.contains("exists"), "{err}");
+    assert!(host
+        .calls()
+        .contains(&"mdadm --stop /dev/md100".to_string()));
+
+    // lock takes the mapper path, and refuses anything but a plain name
+    let host = FakeHost::new();
+    lock(&host, &flat, "/dev/mapper/ev_sdb2").unwrap();
+    assert!(host
+        .calls()
+        .contains(&"cryptsetup close ev_sdb2".to_string()));
+    let err = err_of(lock(&host, &flat, "../../dev/sda"));
+    assert!(err.contains("mapping name"), "{err}");
 }

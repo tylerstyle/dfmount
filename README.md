@@ -18,6 +18,14 @@
   - Locks the device with `blockdev --setro` and verifies the flag before mounting; aborts if that fails.
   - Probes with `blkid -p` and refuses ambiguous, unrecognised, encrypted or unsupported signatures instead of attempting a generic mount.
   - Refuses RAID and LVM members and ZFS pool devices, and points to the dfnix playbook for reassembling them read-only from their images (`/etc/dfnix/playbooks/raid-lvm-zfs.md`).
+- **Read-Only Unlock of Encrypted Evidence** (`dfmount unlock`):
+  - Opens LUKS, BitLocker (password or 48-digit recovery password), VeraCrypt, TrueCrypt and FileVault 2 (Core Storage) volumes with `cryptsetup open --readonly`.
+  - Locks the backing device read-only first, and closes the mapping again if it does not read back as read-only.
+  - The passphrase goes from the terminal straight to cryptsetup (or comes from `--key-file`); dfmount never sees it, and the audit record names only where the key came from.
+- **Read-Only Reassembly of md RAID, LVM and ZFS** (`dfmount assemble`):
+  - Attaches every member image (or, as a fallback, member disk) through a read-only loop device (`losetup -r`), so nothing stacked on it can write to the evidence.
+  - Assembles md with `--readonly`, activates LVM through those loops only with read-only metadata and volumes, and imports ZFS with `readonly=on`, no cache file and every mount below `/media/evidence/zfs_<pool>`; each layer is checked and taken down again on any failure.
+  - `dfmount disassemble` takes it apart and detaches the loops.
 - **Protected-Device Registry & Audit Trail** (via [`dfcore`](https://github.com/tylerstyle/dfcore)):
   - Refuses devices listed in the dfnix boot-time registry (`/run/dfnix/protected.json`), matched by serial/WWN, even when they are no longer mounted or have re-enumerated.
   - Records every evidence mount, unblock, target mount, refusal and unmount in the hash-chained audit log (`/run/dfnix/audit.jsonl`).
@@ -61,6 +69,19 @@ sudo dfmount unblock /dev/sdc --confirm sdc
 
 # Safely unmount
 sudo dfmount umount /media/evidence/sdb1
+
+# Open an encrypted evidence volume read-only (asks for the passphrase or
+# BitLocker recovery password), mount it, close it again
+sudo dfmount unlock /dev/sdb2
+sudo dfmount evidence /dev/mapper/ev_sdb2
+sudo dfmount lock ev_sdb2
+sudo dfmount unlock /dev/sdc --type veracrypt
+
+# Rebuild a RAID 1 from the member images read-only, mount it, take it apart
+sudo dfmount assemble --kind md /media/target/case01/disk1.raw /media/target/case01/disk2.raw --name nas
+sudo dfmount evidence /dev/md100
+sudo dfmount disassemble nas
+sudo dfmount assemble --kind zfs /media/target/case01/pool-disk.raw
 ```
 
 ---
