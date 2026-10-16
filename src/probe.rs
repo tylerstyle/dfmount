@@ -9,6 +9,9 @@ pub struct MountAttempt {
     pub options: String,
 }
 
+/// Read-only reassembly from member images, shipped on dfnix
+pub const ASSEMBLY_PLAYBOOK: &str = "/etc/dfnix/playbooks/raid-lvm-zfs.md";
+
 /// Interpret `blkid -p -o export <dev>`. Low-level probing reads the device
 /// itself instead of the blkid cache and reports conflicting signatures.
 pub fn parse_blkid(dev: &str, code: Option<i32>, stdout: &str) -> Result<String> {
@@ -39,12 +42,27 @@ pub fn parse_blkid(dev: &str, code: Option<i32>, stdout: &str) -> Result<String>
         ),
     };
 
+    // blkid reports a ZFS pool device as a filesystem, but no single device mounts
+    if fstype == "zfs_member" {
+        bail!(
+            "{}: zfs_member is part of a ZFS pool; image every pool device and import the images read-only, see {}",
+            dev,
+            ASSEMBLY_PLAYBOOK
+        );
+    }
+
     match field("USAGE").as_deref() {
         None | Some("filesystem") => Ok(fstype),
         Some("crypto") => bail!(
             "{}: {} is an encrypted container; open it read-only first (cryptsetup open --readonly) and mount the mapped device",
             dev,
             fstype
+        ),
+        Some("raid") => bail!(
+            "{}: {} is a RAID or LVM member (usage raid); image every member and reassemble the images read-only, see {}",
+            dev,
+            fstype,
+            ASSEMBLY_PLAYBOOK
         ),
         Some(usage) => bail!("{}: {} signature ({}) is not a mountable filesystem", dev, fstype, usage),
     }
@@ -142,6 +160,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("--readonly"), "{err}");
+    }
+
+    #[test]
+    fn blkid_members_point_to_the_reassembly_playbook() {
+        for (out, kind) in [
+            ("TYPE=linux_raid_member\nUSAGE=raid\n", "RAID or LVM member"),
+            ("TYPE=LVM2_member\nUSAGE=raid\n", "RAID or LVM member"),
+            ("TYPE=zfs_member\nUSAGE=filesystem\n", "ZFS pool"),
+        ] {
+            let err = parse_blkid("/dev/sdb3", Some(0), out)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(kind) && err.contains(ASSEMBLY_PLAYBOOK),
+                "{err}"
+            );
+        }
     }
 
     #[test]

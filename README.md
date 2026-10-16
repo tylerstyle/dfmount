@@ -17,6 +17,7 @@
   - Mounts NTFS read-only via `ntfs3`, falling back to `ntfs-3g` (also read-only).
   - Locks the device with `blockdev --setro` and verifies the flag before mounting; aborts if that fails.
   - Probes with `blkid -p` and refuses ambiguous, unrecognised, encrypted or unsupported signatures instead of attempting a generic mount.
+  - Refuses RAID and LVM members and ZFS pool devices, and points to the dfnix playbook for reassembling them read-only from their images (`/etc/dfnix/playbooks/raid-lvm-zfs.md`).
 - **Protected-Device Registry & Audit Trail** (via [`dfcore`](https://github.com/tylerstyle/dfcore)):
   - Refuses devices listed in the dfnix boot-time registry (`/run/dfnix/protected.json`), matched by serial/WWN, even when they are no longer mounted or have re-enumerated.
   - Records every evidence mount, unblock, target mount, refusal and unmount in the hash-chained audit log (`/run/dfnix/audit.jsonl`).
