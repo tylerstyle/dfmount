@@ -47,6 +47,8 @@
 - `r`: Rescan storage media
 - `q` / `Esc`: Quit
 
+When its terminal goes away, the TUI ends quietly.
+
 ---
 
 ## 📦 CLI Usage

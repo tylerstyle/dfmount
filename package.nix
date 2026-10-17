@@ -26,7 +26,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfmount";
-  version = "0.1.1";
+  version = "0.1.2";
 
   inherit src;
   sourceRoot = "dfmount-src/dfmount";
