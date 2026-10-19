@@ -1,6 +1,6 @@
 [package]
 name = "dfmount"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["tylerstyle <tylerstyle@users.noreply.github.com>"]
 description = "Modern forensic storage mounter, write-blocker and target unblocker TUI/CLI tool"

@@ -26,7 +26,7 @@ let
 in
 rustPlatform.buildRustPackage {
   pname = "dfmount";
-  version = "0.1.2";
+  version = "0.1.3";
 
   inherit src;
   sourceRoot = "dfmount-src/dfmount";
@@ -50,22 +50,6 @@ rustPlatform.buildRustPackage {
     wrapProgram $out/bin/dfmount \
       --prefix PATH : ${lib.makeBinPath [ util-linux coreutils cryptsetup mdadm lvm2 ]}
     # zpool/zfs come from the system: they must match its kernel module
-
-    # Desktop launcher entry
-    mkdir -p $out/share/applications
-    cat > $out/share/applications/dfmount.desktop <<EOF
-[Desktop Entry]
-Version=1.0
-Name=dfmount Forensic Storage TUI
-GenericName=Forensic Disk Mounter
-Comment=Mount evidence write-blocked with zero journal replay or unblock target drives
-Exec=kitty --title "dfmount - Forensic Storage Manager" sudo dfmount
-Icon=drive-harddisk-system
-Terminal=false
-Type=Application
-Categories=System;Forensics;Utility;
-Keywords=forensics;mount;writeblock;target;dfdisk;
-EOF
   '';
 
   meta = with lib; {
